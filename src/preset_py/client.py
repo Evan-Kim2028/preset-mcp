@@ -15,7 +15,7 @@ from preset_cli.api.clients.superset import SupersetClient
 
 from preset_py._helpers import create_chart as _create_chart
 from preset_py._helpers import create_virtual_dataset
-from preset_py.snapshot import WorkspaceSnapshot, take_snapshot, save_snapshot
+from preset_py.snapshot import WorkspaceSnapshot, take_snapshot
 
 PRESET_API_URL = "https://api.app.preset.io/"
 

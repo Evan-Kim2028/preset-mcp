@@ -6,45 +6,63 @@ MCP server for [Preset](https://preset.io) (managed Apache Superset). Manage das
 Claude Code ──STDIO──> preset-mcp ──> Preset API
 ```
 
-## Quick Start
+## Setup for Claude Code
 
-### Install
-
-```bash
-pip install preset-mcp
-# or
-uv add preset-mcp
-```
-
-### Get API Credentials
+### 1. Get your Preset API credentials
 
 1. Log in to [app.preset.io](https://app.preset.io)
 2. Go to **Settings > API Keys**
 3. Create a new token/secret pair
+4. Copy both the **token** and **secret**
 
-### Register with Claude Code
+### 2. Install and register (one command)
 
-```bash
-claude mcp add preset-mcp -- \
-  env PRESET_API_TOKEN=your_token PRESET_API_SECRET=your_secret \
-  preset-mcp
-```
-
-Or auto-connect to a workspace on startup:
+The simplest setup — `uv run` handles installation automatically:
 
 ```bash
-claude mcp add preset-mcp -- \
-  env PRESET_API_TOKEN=your_token \
-      PRESET_API_SECRET=your_secret \
-      PRESET_WORKSPACE="Your Workspace Title" \
-  preset-mcp
+claude mcp add --scope user preset-mcp -- \
+  uv run --from preset-mcp \
+    --with preset-cli --with fastmcp --with sqlglot --with pydantic \
+    env PRESET_API_TOKEN=<your-token> PRESET_API_SECRET=<your-secret> \
+    preset-mcp
 ```
 
-Verify it's connected:
+To auto-connect to a specific workspace on startup, add the `PRESET_WORKSPACE` variable:
+
+```bash
+claude mcp add --scope user preset-mcp -- \
+  uv run --from preset-mcp \
+    --with preset-cli --with fastmcp --with sqlglot --with pydantic \
+    env PRESET_API_TOKEN=<your-token> \
+        PRESET_API_SECRET=<your-secret> \
+        PRESET_WORKSPACE="Your Workspace Title" \
+    preset-mcp
+```
+
+### 3. Verify
 
 ```bash
 claude mcp list
-# Should show preset-mcp with 16 tools
+# Should show: preset-mcp  ... 16 tools
+```
+
+Then in a Claude Code session, try:
+
+```
+> list my preset workspaces
+```
+
+### Alternative: Install from source
+
+```bash
+git clone https://github.com/Evan-Kim2028/preset-mcp.git
+cd preset-mcp
+uv sync
+
+claude mcp add --scope user preset-mcp -- \
+  uv run --directory /path/to/preset-mcp \
+    env PRESET_API_TOKEN=<your-token> PRESET_API_SECRET=<your-secret> \
+    preset-mcp
 ```
 
 ## Tools (16)
