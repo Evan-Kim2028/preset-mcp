@@ -15,31 +15,30 @@ Claude Code ──STDIO──> preset-mcp ──> Preset API
 3. Create a new token/secret pair
 4. Copy both the **token** and **secret**
 
-### 2. Install and register (one command)
-
-The simplest setup — `uv run` handles installation automatically:
+### 2. Install from PyPI
 
 ```bash
-claude mcp add --scope user preset-mcp -- \
-  uv run --from preset-mcp \
-    --with preset-cli --with fastmcp --with sqlglot --with pydantic \
-    env PRESET_API_TOKEN=<your-token> PRESET_API_SECRET=<your-secret> \
-    preset-mcp
+uv tool install preset-mcp --with preset-cli --with fastmcp --with sqlglot --with pydantic
 ```
 
-To auto-connect to a specific workspace on startup, add the `PRESET_WORKSPACE` variable:
+### 3. Register with Claude Code
 
 ```bash
-claude mcp add --scope user preset-mcp -- \
-  uv run --from preset-mcp \
-    --with preset-cli --with fastmcp --with sqlglot --with pydantic \
-    env PRESET_API_TOKEN=<your-token> \
-        PRESET_API_SECRET=<your-secret> \
-        PRESET_WORKSPACE="Your Workspace Title" \
-    preset-mcp
+claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
+  -e PRESET_API_SECRET=<your-secret> \
+  preset-mcp -- preset-mcp
 ```
 
-### 3. Verify
+To auto-connect to a specific workspace on startup:
+
+```bash
+claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
+  -e PRESET_API_SECRET=<your-secret> \
+  -e PRESET_WORKSPACE="Your Workspace Title" \
+  preset-mcp -- preset-mcp
+```
+
+### 4. Verify
 
 ```bash
 claude mcp list
@@ -59,10 +58,9 @@ git clone https://github.com/Evan-Kim2028/preset-mcp.git
 cd preset-mcp
 uv sync
 
-claude mcp add --scope user preset-mcp -- \
-  uv run --directory /path/to/preset-mcp \
-    env PRESET_API_TOKEN=<your-token> PRESET_API_SECRET=<your-secret> \
-    preset-mcp
+claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
+  -e PRESET_API_SECRET=<your-secret> \
+  preset-mcp -- uv run --directory /path/to/preset-mcp preset-mcp
 ```
 
 ## Tools (16)
