@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -13,11 +14,91 @@ from preset_cli.auth.jwt import JWTAuth
 from preset_cli.api.clients.preset import PresetClient
 from preset_cli.api.clients.superset import SupersetClient
 
-from preset_py._helpers import create_chart as _create_chart
-from preset_py._helpers import create_virtual_dataset
 from preset_py.snapshot import WorkspaceSnapshot, take_snapshot
 
 PRESET_API_URL = "https://api.app.preset.io/"
+
+
+# ---------------------------------------------------------------------------
+# Dataset / chart creation helpers (moved from _helpers.py)
+# ---------------------------------------------------------------------------
+
+
+def _create_virtual_dataset(
+    client: SupersetClient,
+    name: str,
+    sql: str,
+    database_id: int,
+    schema: str | None = None,
+) -> dict[str, Any]:
+    """Create a virtual (SQL-based) dataset and refresh its column metadata."""
+    payload: dict[str, Any] = {
+        "table_name": name,
+        "sql": sql,
+        "database": database_id,
+    }
+    if schema:
+        payload["schema"] = schema
+
+    result = client.create_dataset(**payload)
+
+    # Refresh column metadata so the dataset is immediately usable
+    dataset_id = result.get("id")
+    if dataset_id:
+        try:
+            client.get_refreshed_dataset_columns(dataset_id)
+        except Exception:
+            pass  # non-fatal; columns will refresh on first use
+
+    return result
+
+
+def _create_chart(
+    client: SupersetClient,
+    dataset_id: int,
+    title: str,
+    viz_type: str,
+    *,
+    metrics: list[str] | None = None,
+    groupby: list[str] | None = None,
+    time_column: str | None = None,
+    dashboards: list[int] | None = None,
+    extra_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a chart with sensible defaults.
+
+    ``extra_params`` is merged into the chart params dict, allowing callers
+    to pass any viz-type-specific options.
+    """
+    params: dict[str, Any] = {
+        "viz_type": viz_type,
+    }
+    if metrics:
+        params["metrics"] = metrics
+    if groupby:
+        params["groupby"] = groupby
+    if time_column:
+        params["granularity_sqla"] = time_column
+
+    if extra_params:
+        params.update(extra_params)
+
+    payload: dict[str, Any] = {
+        "slice_name": title,
+        "viz_type": viz_type,
+        "datasource_id": dataset_id,
+        "datasource_type": "table",
+        "params": json.dumps(params),
+    }
+    if dashboards:
+        payload["dashboards"] = dashboards
+
+    return client.create_resource("chart", **payload)
+
+
+# ---------------------------------------------------------------------------
+# Connection
+# ---------------------------------------------------------------------------
 
 
 def connect(workspace: str | None = None) -> PresetWorkspace:
@@ -175,7 +256,7 @@ class PresetWorkspace:
         database_id: int,
         schema: str | None = None,
     ) -> dict[str, Any]:
-        return create_virtual_dataset(
+        return _create_virtual_dataset(
             self._client, name, sql, database_id, schema
         )
 
@@ -249,6 +330,18 @@ class PresetWorkspace:
         """Export dashboards as a ZIP bundle (bytes)."""
         buf = self._client.export_zip("dashboard", ids)
         return buf.getvalue()
+
+    def delete_resource(self, resource_type: str, resource_id: int) -> None:
+        self._client.delete_resource(resource_type, resource_id)
+
+    def export_resource_zip(self, resource_type: str, ids: list[int]) -> bytes:
+        """Export any resource type as a ZIP bundle (bytes)."""
+        buf = self._client.export_zip(resource_type, ids)
+        return buf.getvalue()
+
+    def import_resource_zip(self, resource_type: str, data: bytes, overwrite: bool = False) -> bool:
+        from io import BytesIO
+        return self._client.import_zip(resource_type, BytesIO(data), overwrite=overwrite)
 
     # ------------------------------------------------------------------
     # Snapshot

@@ -28,6 +28,8 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Literal
 
 import sqlglot
@@ -38,9 +40,11 @@ from fastmcp.exceptions import ToolError
 
 from preset_py.client import PresetWorkspace, connect
 from preset_py._safety import (
+    AUDIT_DIR,
     MutationEntry,
     capture_before,
     check_dataset_dependents,
+    export_before_delete,
     record_mutation,
     validate_params_json,
 )
@@ -291,78 +295,184 @@ def _validate_readonly(sql: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _exception_to_tool_error(tool_name: str, exc: Exception) -> ToolError:
+    """Map exception to structured ToolError with hints."""
+    if isinstance(exc, KeyError):
+        _log.warning("tool=%s error=missing_env key=%s", tool_name, exc)
+        return ToolError(
+            json.dumps({
+                "error": f"Missing environment variable: {exc}",
+                "error_type": "configuration",
+                "hints": [
+                    "Set PRESET_API_TOKEN and PRESET_API_SECRET.",
+                    "Optionally set PRESET_WORKSPACE to auto-connect.",
+                ],
+            })
+        )
+
+    if isinstance(exc, RuntimeError):
+        _log.warning("tool=%s error=no_workspace", tool_name)
+        return ToolError(
+            json.dumps({
+                "error": str(exc),
+                "error_type": "no_workspace",
+                "hints": [
+                    "Call list_workspaces to see available workspaces.",
+                    "Then call use_workspace('Title') to select one.",
+                ],
+            })
+        )
+
+    if isinstance(exc, ValueError):
+        _log.warning("tool=%s error=validation msg=%s", tool_name, exc)
+        return ToolError(
+            json.dumps({
+                "error": str(exc),
+                "error_type": "validation",
+                "hints": [
+                    "Check parameter values and try again.",
+                ],
+            })
+        )
+
+    _log.error("tool=%s error=api msg=%s", tool_name, exc)
+    return ToolError(
+        json.dumps({
+            "error": f"Preset API error: {exc}",
+            "error_type": "api_error",
+            "hints": [
+                "This may be transient — retry once.",
+                "If the error mentions a resource ID, verify it "
+                "exists with the corresponding list_* tool.",
+            ],
+        })
+    )
+
+
 def _handle_errors(fn):
     """Decorator: catch exceptions → structured ToolError with hints."""
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         t0 = time.monotonic()
-        name = fn.__name__
         try:
             result = fn(*args, **kwargs)
-            dur = (time.monotonic() - t0) * 1000
-            _log.info("tool=%s status=ok duration_ms=%.0f", name, dur)
+            _log.info(
+                "tool=%s status=ok duration_ms=%.0f",
+                fn.__name__, (time.monotonic() - t0) * 1000,
+            )
             return result
-
-        except KeyError as exc:
-            _log.warning("tool=%s error=missing_env key=%s", name, exc)
-            raise ToolError(
-                json.dumps({
-                    "error": f"Missing environment variable: {exc}",
-                    "error_type": "configuration",
-                    "hints": [
-                        "Set PRESET_API_TOKEN and PRESET_API_SECRET.",
-                        "Optionally set PRESET_WORKSPACE to auto-connect.",
-                    ],
-                })
-            ) from exc
-
-        except RuntimeError as exc:
-            _log.warning("tool=%s error=no_workspace", name)
-            raise ToolError(
-                json.dumps({
-                    "error": str(exc),
-                    "error_type": "no_workspace",
-                    "hints": [
-                        "Call list_workspaces to see available workspaces.",
-                        "Then call use_workspace('Title') to select one.",
-                    ],
-                })
-            ) from exc
-
-        except ValueError as exc:
-            _log.warning("tool=%s error=validation msg=%s", name, exc)
-            raise ToolError(
-                json.dumps({
-                    "error": str(exc),
-                    "error_type": "validation",
-                    "hints": [
-                        "Check parameter values and try again.",
-                    ],
-                })
-            ) from exc
-
         except ToolError:
             raise
-
         except Exception as exc:
-            dur = (time.monotonic() - t0) * 1000
-            _log.error(
-                "tool=%s error=api duration_ms=%.0f msg=%s", name, dur, exc,
-            )
-            raise ToolError(
-                json.dumps({
-                    "error": f"Preset API error: {exc}",
-                    "error_type": "api_error",
-                    "hints": [
-                        "This may be transient — retry once.",
-                        "If the error mentions a resource ID, verify it "
-                        "exists with the corresponding list_* tool.",
-                    ],
-                })
-            ) from exc
+            raise _exception_to_tool_error(fn.__name__, exc) from exc
 
     return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Mutation helper — consolidates audit/dry-run/response boilerplate
+# ---------------------------------------------------------------------------
+
+
+def _do_mutation(
+    *,
+    tool_name: str,
+    resource_type: str,
+    action: Literal["create", "update", "delete"],
+    fields_changed: list[str],
+    dry_run: bool,
+    execute: Callable[[], dict[str, Any]],
+    resource_id: int | None = None,
+    before: dict[str, Any] | None = None,
+    export_path: Path | None = None,
+    preview_extras: dict[str, Any] | None = None,
+    result_extras: dict[str, Any] | None = None,
+    after_extras: dict[str, Any] | None = None,
+) -> str:
+    """Handle audit/dry-run/response pattern for all mutation tools.
+
+    Dry-run path: builds preview JSON, records audit, returns.
+    Execute path: calls ``execute()``, builds response, records audit, returns.
+
+    Extra dicts are merged into the appropriate output:
+      - ``preview_extras`` → dry-run preview (e.g. ``{"values": {...}}``)
+      - ``result_extras``  → execution response (e.g. ``{"_dependency_impact": ...}``)
+      - ``after_extras``   → ``after_summary`` in audit entry (e.g. ``{"dashboard_title": ...}``)
+    """
+    # -- Dry-run path -------------------------------------------------------
+    if dry_run:
+        preview: dict[str, Any] = {
+            "dry_run": True,
+            "action": tool_name,
+            "fields_to_change": fields_changed,
+        }
+        if resource_id is not None:
+            preview[f"{resource_type}_id"] = resource_id
+        if before is not None:
+            preview["current_state"] = before
+        if export_path is not None:
+            preview["export_path"] = str(export_path)
+        if preview_extras:
+            preview.update(preview_extras)
+
+        dry_after: dict[str, Any] | None = None
+        if export_path is not None:
+            dry_after = {"export_path": str(export_path)}
+        if after_extras:
+            dry_after = dry_after or {}
+            dry_after.update(after_extras)
+
+        record_mutation(MutationEntry(
+            tool_name=tool_name,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            action=action,
+            fields_changed=fields_changed,
+            before_snapshot=before,
+            after_summary=dry_after,
+            dry_run=True,
+        ))
+        return json.dumps(preview, indent=2, default=str)
+
+    # -- Execute path -------------------------------------------------------
+    result = execute()
+
+    if action == "create":
+        rid = result.get("id") if result else None
+        after_summary: dict[str, Any] = {"id": rid}
+        resource_id = rid
+        response = result
+    elif action == "delete":
+        after_summary = {}
+        if export_path is not None:
+            after_summary["export_path"] = str(export_path)
+        response: dict[str, Any] = {
+            "status": "deleted",
+            f"{resource_type}_id": resource_id,
+        }
+        if export_path is not None:
+            response["export_path"] = str(export_path)
+    else:  # update
+        after_summary = {"id": resource_id, "fields_updated": fields_changed}
+        response = result if isinstance(result, dict) else {"result": result}
+
+    if after_extras:
+        after_summary.update(after_extras)
+    if result_extras:
+        response.update(result_extras)
+
+    record_mutation(MutationEntry(
+        tool_name=tool_name,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        action=action,
+        fields_changed=fields_changed,
+        before_snapshot=before,
+        after_summary=after_summary,
+    ))
+
+    return json.dumps(response, indent=2, default=str)
 
 
 # ===================================================================
@@ -639,36 +749,17 @@ def create_dashboard(
         dry_run: If True, validate inputs and return a preview without
                  making any changes (default: False)
     """
-    if dry_run:
-        entry = MutationEntry(
-            tool_name="create_dashboard",
-            resource_type="dashboard",
-            action="create",
-            fields_changed=["dashboard_title", "published"],
-            dry_run=True,
-        )
-        record_mutation(entry)
-        return json.dumps({
-            "dry_run": True,
-            "action": "create_dashboard",
-            "fields_to_change": ["dashboard_title", "published"],
-            "values": {"dashboard_title": dashboard_title, "published": published},
-        }, indent=2)
-
     ws = _get_ws()
-    result = ws.create_dashboard(dashboard_title, published=published)
-    _log.info("create_dashboard title=%s id=%s", dashboard_title, result.get("id"))
-
-    record_mutation(MutationEntry(
+    return _do_mutation(
         tool_name="create_dashboard",
         resource_type="dashboard",
-        resource_id=result.get("id"),
         action="create",
         fields_changed=["dashboard_title", "published"],
-        after_summary={"id": result.get("id"), "dashboard_title": dashboard_title},
-    ))
-
-    return json.dumps(result, indent=2, default=str)
+        dry_run=dry_run,
+        execute=lambda: ws.create_dashboard(dashboard_title, published=published),
+        preview_extras={"values": {"dashboard_title": dashboard_title, "published": published}},
+        after_extras={"dashboard_title": dashboard_title},
+    )
 
 
 @mcp.tool()
@@ -698,42 +789,20 @@ def create_dataset(
                  making any changes (default: False)
     """
     _validate_readonly(sql)
-
-    if dry_run:
-        entry = MutationEntry(
-            tool_name="create_dataset",
-            resource_type="dataset",
-            action="create",
-            fields_changed=["name", "sql", "database_id", "schema"],
-            dry_run=True,
-        )
-        record_mutation(entry)
-        return json.dumps({
-            "dry_run": True,
-            "action": "create_dataset",
-            "fields_to_change": ["name", "sql", "database_id", "schema"],
-            "values": {
-                "name": name,
-                "sql": sql,
-                "database_id": database_id,
-                "schema": schema,
-            },
-        }, indent=2)
-
     ws = _get_ws()
-    result = ws.create_dataset(name, sql, database_id, schema=schema)
-    _log.info("create_dataset name=%s id=%s", name, result.get("id"))
-
-    record_mutation(MutationEntry(
+    return _do_mutation(
         tool_name="create_dataset",
         resource_type="dataset",
-        resource_id=result.get("id"),
         action="create",
         fields_changed=["name", "sql", "database_id", "schema"],
-        after_summary={"id": result.get("id"), "name": name},
-    ))
-
-    return json.dumps(result, indent=2, default=str)
+        dry_run=dry_run,
+        execute=lambda: ws.create_dataset(name, sql, database_id, schema=schema),
+        preview_extras={"values": {
+            "name": name, "sql": sql,
+            "database_id": database_id, "schema": schema,
+        }},
+        after_extras={"name": name},
+    )
 
 
 @mcp.tool()
@@ -776,52 +845,25 @@ def create_chart(
     if dashboards is not None:
         fields.append("dashboards")
 
-    if dry_run:
-        entry = MutationEntry(
-            tool_name="create_chart",
-            resource_type="chart",
-            action="create",
-            fields_changed=fields,
-            dry_run=True,
-        )
-        record_mutation(entry)
-        return json.dumps({
-            "dry_run": True,
-            "action": "create_chart",
-            "fields_to_change": fields,
-            "values": {
-                "dataset_id": dataset_id,
-                "title": title,
-                "viz_type": viz_type,
-                "metrics": metrics,
-                "groupby": groupby,
-                "time_column": time_column,
-                "dashboards": dashboards,
-            },
-        }, indent=2)
-
     ws = _get_ws()
-    result = ws.create_chart(
-        dataset_id,
-        title,
-        viz_type,
-        metrics=metrics,
-        groupby=groupby,
-        time_column=time_column,
-        dashboards=dashboards,
-    )
-    _log.info("create_chart title=%s id=%s", title, result.get("id"))
-
-    record_mutation(MutationEntry(
+    return _do_mutation(
         tool_name="create_chart",
         resource_type="chart",
-        resource_id=result.get("id"),
         action="create",
         fields_changed=fields,
-        after_summary={"id": result.get("id"), "title": title},
-    ))
-
-    return json.dumps(result, indent=2, default=str)
+        dry_run=dry_run,
+        execute=lambda: ws.create_chart(
+            dataset_id, title, viz_type,
+            metrics=metrics, groupby=groupby,
+            time_column=time_column, dashboards=dashboards,
+        ),
+        preview_extras={"values": {
+            "dataset_id": dataset_id, "title": title, "viz_type": viz_type,
+            "metrics": metrics, "groupby": groupby,
+            "time_column": time_column, "dashboards": dashboards,
+        }},
+        after_extras={"title": title},
+    )
 
 
 # ===================================================================
@@ -858,6 +900,7 @@ def update_dataset(
     """
     kwargs: dict[str, Any] = {}
     if sql is not None:
+        _validate_readonly(sql)
         kwargs["sql"] = sql
     if name is not None:
         kwargs["table_name"] = name
@@ -870,8 +913,6 @@ def update_dataset(
         )
 
     ws = _get_ws()
-
-    # Pre-mutation snapshot
     before = capture_before(ws, "dataset", dataset_id)
 
     # Dependency check when SQL changes or columns are overridden
@@ -879,55 +920,35 @@ def update_dataset(
     if sql is not None or override_columns:
         dependency_impact = check_dataset_dependents(ws, dataset_id)
 
-    if dry_run:
-        entry = MutationEntry(
-            tool_name="update_dataset",
-            resource_type="dataset",
-            resource_id=dataset_id,
-            action="update",
-            fields_changed=list(kwargs.keys()),
-            before_snapshot=before,
-            dry_run=True,
-        )
-        record_mutation(entry)
-        preview: dict[str, Any] = {
-            "dry_run": True,
-            "action": "update_dataset",
-            "dataset_id": dataset_id,
-            "fields_to_change": list(kwargs.keys()),
-            "current_state": before,
-        }
-        if dependency_impact:
-            preview["dependency_impact"] = dependency_impact
-        return json.dumps(preview, indent=2, default=str)
-
-    result = ws.update_dataset(
-        dataset_id, override_columns=override_columns, **kwargs
-    )
-    _log.info("update_dataset id=%d fields=%s", dataset_id, list(kwargs.keys()))
-
-    record_mutation(MutationEntry(
-        tool_name="update_dataset",
-        resource_type="dataset",
-        resource_id=dataset_id,
-        action="update",
-        fields_changed=list(kwargs.keys()),
-        before_snapshot=before,
-        after_summary={"id": dataset_id, "fields_updated": list(kwargs.keys())},
-    ))
-
-    # Attach advisory info to the response
-    response = result if isinstance(result, dict) else {"result": result}
+    # Build result_extras for advisory warnings
+    extras: dict[str, Any] = {}
     if dependency_impact:
-        response["_dependency_impact"] = dependency_impact
-    if override_columns and dependency_impact and dependency_impact.get("chart_count", 0) > 0:
-        response["_override_columns_warning"] = (
+        extras["_dependency_impact"] = dependency_impact
+    if (
+        override_columns
+        and dependency_impact
+        and dependency_impact.get("chart_count", 0) > 0
+    ):
+        extras["_override_columns_warning"] = (
             f"override_columns=True will refresh column metadata. "
             f"{dependency_impact['chart_count']} chart(s) may be affected: "
             f"{[c['name'] for c in dependency_impact.get('affected_charts', [])]}"
         )
 
-    return json.dumps(response, indent=2, default=str)
+    return _do_mutation(
+        tool_name="update_dataset",
+        resource_type="dataset",
+        action="update",
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        execute=lambda: ws.update_dataset(
+            dataset_id, override_columns=override_columns, **kwargs
+        ),
+        resource_id=dataset_id,
+        before=before,
+        preview_extras={"dependency_impact": dependency_impact} if dependency_impact else None,
+        result_extras=extras or None,
+    )
 
 
 @mcp.tool()
@@ -957,7 +978,6 @@ def update_chart(
                  return a preview without making any changes
                  (default: False)
     """
-    # Validate params_json before building kwargs
     if params_json is not None:
         validate_params_json(params_json)
 
@@ -978,43 +998,18 @@ def update_chart(
         )
 
     ws = _get_ws()
-
-    # Pre-mutation snapshot
     before = capture_before(ws, "chart", chart_id)
 
-    if dry_run:
-        entry = MutationEntry(
-            tool_name="update_chart",
-            resource_type="chart",
-            resource_id=chart_id,
-            action="update",
-            fields_changed=list(kwargs.keys()),
-            before_snapshot=before,
-            dry_run=True,
-        )
-        record_mutation(entry)
-        return json.dumps({
-            "dry_run": True,
-            "action": "update_chart",
-            "chart_id": chart_id,
-            "fields_to_change": list(kwargs.keys()),
-            "current_state": before,
-        }, indent=2, default=str)
-
-    result = ws.update_chart(chart_id, **kwargs)
-    _log.info("update_chart id=%d fields=%s", chart_id, list(kwargs.keys()))
-
-    record_mutation(MutationEntry(
+    return _do_mutation(
         tool_name="update_chart",
         resource_type="chart",
-        resource_id=chart_id,
         action="update",
         fields_changed=list(kwargs.keys()),
-        before_snapshot=before,
-        after_summary={"id": chart_id, "fields_updated": list(kwargs.keys())},
-    ))
-
-    return json.dumps(result, indent=2, default=str)
+        dry_run=dry_run,
+        execute=lambda: ws.update_chart(chart_id, **kwargs),
+        resource_id=chart_id,
+        before=before,
+    )
 
 
 @mcp.tool()
@@ -1050,43 +1045,18 @@ def update_dashboard(
         )
 
     ws = _get_ws()
-
-    # Pre-mutation snapshot
     before = capture_before(ws, "dashboard", dashboard_id)
 
-    if dry_run:
-        entry = MutationEntry(
-            tool_name="update_dashboard",
-            resource_type="dashboard",
-            resource_id=dashboard_id,
-            action="update",
-            fields_changed=list(kwargs.keys()),
-            before_snapshot=before,
-            dry_run=True,
-        )
-        record_mutation(entry)
-        return json.dumps({
-            "dry_run": True,
-            "action": "update_dashboard",
-            "dashboard_id": dashboard_id,
-            "fields_to_change": list(kwargs.keys()),
-            "current_state": before,
-        }, indent=2, default=str)
-
-    result = ws.update_dashboard(dashboard_id, **kwargs)
-    _log.info("update_dashboard id=%d fields=%s", dashboard_id, list(kwargs.keys()))
-
-    record_mutation(MutationEntry(
+    return _do_mutation(
         tool_name="update_dashboard",
         resource_type="dashboard",
-        resource_id=dashboard_id,
         action="update",
         fields_changed=list(kwargs.keys()),
-        before_snapshot=before,
-        after_summary={"id": dashboard_id, "fields_updated": list(kwargs.keys())},
-    ))
-
-    return json.dumps(result, indent=2, default=str)
+        dry_run=dry_run,
+        execute=lambda: ws.update_dashboard(dashboard_id, **kwargs),
+        resource_id=dashboard_id,
+        before=before,
+    )
 
 
 # ===================================================================
@@ -1107,6 +1077,224 @@ def snapshot_workspace() -> str:
     snap = ws.snapshot()
     _log.info("snapshot counts=%s", snap.counts)
     return json.dumps(snap.model_dump(), indent=2, default=str)
+
+
+# ===================================================================
+# Tools — Delete operations (opt-in via PRESET_MCP_ENABLE_DELETE)
+# ===================================================================
+
+_DELETE_ENABLED = os.environ.get("PRESET_MCP_ENABLE_DELETE", "").lower() in (
+    "true", "1", "yes",
+)
+
+if _DELETE_ENABLED:
+
+    @mcp.tool()
+    @_handle_errors
+    def delete_dashboard(dashboard_id: int, dry_run: bool = False) -> str:
+        """Delete a dashboard after exporting a full backup.
+
+        A ZIP backup is saved to ~/.preset-mcp/audit/exports/ BEFORE the
+        delete proceeds.  If the export fails, the dashboard is NOT deleted.
+
+        Requires PRESET_MCP_ENABLE_DELETE=true to be available.
+
+        Args:
+            dashboard_id: ID of the dashboard to delete
+            dry_run: If True, export backup and return preview without
+                     actually deleting (default: False)
+        """
+        ws = _get_ws()
+        before = capture_before(ws, "dashboard", dashboard_id)
+        ep = export_before_delete(ws, "dashboard", dashboard_id)
+
+        return _do_mutation(
+            tool_name="delete_dashboard",
+            resource_type="dashboard",
+            action="delete",
+            fields_changed=[],
+            dry_run=dry_run,
+            execute=lambda: ws.delete_resource("dashboard", dashboard_id) or {},
+            resource_id=dashboard_id,
+            before=before,
+            export_path=ep,
+        )
+
+    @mcp.tool()
+    @_handle_errors
+    def delete_chart(chart_id: int, dry_run: bool = False) -> str:
+        """Delete a chart after exporting a full backup.
+
+        A ZIP backup is saved to ~/.preset-mcp/audit/exports/ BEFORE the
+        delete proceeds.  If the export fails, the chart is NOT deleted.
+
+        Requires PRESET_MCP_ENABLE_DELETE=true to be available.
+
+        Args:
+            chart_id: ID of the chart to delete
+            dry_run: If True, export backup and return preview without
+                     actually deleting (default: False)
+        """
+        ws = _get_ws()
+        before = capture_before(ws, "chart", chart_id)
+        ep = export_before_delete(ws, "chart", chart_id)
+
+        return _do_mutation(
+            tool_name="delete_chart",
+            resource_type="chart",
+            action="delete",
+            fields_changed=[],
+            dry_run=dry_run,
+            execute=lambda: ws.delete_resource("chart", chart_id) or {},
+            resource_id=chart_id,
+            before=before,
+            export_path=ep,
+        )
+
+    @mcp.tool()
+    @_handle_errors
+    def delete_dataset(
+        dataset_id: int,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> str:
+        """Delete a dataset after exporting a full backup.
+
+        If charts depend on this dataset, the delete is blocked unless
+        force=True.  A ZIP backup is always saved before deletion.
+
+        Requires PRESET_MCP_ENABLE_DELETE=true to be available.
+
+        Args:
+            dataset_id: ID of the dataset to delete
+            force: If True, delete even if charts depend on this dataset
+                   (default: False)
+            dry_run: If True, export backup and return preview without
+                     actually deleting (default: False)
+        """
+        ws = _get_ws()
+
+        deps = check_dataset_dependents(ws, dataset_id)
+        if deps["chart_count"] > 0 and not force:
+            raise ValueError(
+                f"Cannot delete dataset {dataset_id}: "
+                f"{deps['chart_count']} chart(s) depend on it: "
+                f"{[c['name'] for c in deps['affected_charts']]}. "
+                f"Use force=True to delete anyway."
+            )
+
+        before = capture_before(ws, "dataset", dataset_id)
+        ep = export_before_delete(ws, "dataset", dataset_id)
+
+        return _do_mutation(
+            tool_name="delete_dataset",
+            resource_type="dataset",
+            action="delete",
+            fields_changed=[],
+            dry_run=dry_run,
+            execute=lambda: ws.delete_resource("dataset", dataset_id) or {},
+            resource_id=dataset_id,
+            before=before,
+            export_path=ep,
+            preview_extras={"dependency_info": deps},
+            result_extras={"dependency_info": deps},
+            after_extras={"dependency_info": deps},
+        )
+
+    @mcp.tool()
+    @_handle_errors
+    def list_deleted_backups(resource_type: str | None = None) -> str:
+        """List ZIP backups from previous delete operations.
+
+        Scans ~/.preset-mcp/audit/exports/ for backup files.  Use the
+        export_path with restore_from_backup to undo a deletion.
+
+        Requires PRESET_MCP_ENABLE_DELETE=true to be available.
+
+        Args:
+            resource_type: Filter by type ('dashboard', 'chart', 'dataset').
+                           If None, shows all backups.
+        """
+        exports_dir = AUDIT_DIR / "exports"
+        if not exports_dir.exists():
+            return json.dumps({"backups": [], "count": 0}, indent=2)
+
+        backups: list[dict[str, Any]] = []
+        for f in sorted(exports_dir.glob("*.zip")):
+            parts = f.stem.rsplit("_", 2)
+            if len(parts) == 3:
+                rtype, rid, ts = parts
+            else:
+                rtype, rid, ts = f.stem, "unknown", "unknown"
+
+            if resource_type and rtype != resource_type:
+                continue
+
+            backups.append({
+                "filename": f.name,
+                "resource_type": rtype,
+                "resource_id": rid,
+                "timestamp": ts,
+                "size_bytes": f.stat().st_size,
+                "export_path": str(f),
+            })
+
+        return json.dumps({
+            "backups": backups,
+            "count": len(backups),
+        }, indent=2)
+
+    @mcp.tool()
+    @_handle_errors
+    def restore_from_backup(
+        export_path: str,
+        resource_type: str,
+        overwrite: bool = True,
+    ) -> str:
+        """Restore a previously deleted resource from a ZIP backup.
+
+        Use list_deleted_backups to find the export_path and resource_type.
+
+        Requires PRESET_MCP_ENABLE_DELETE=true to be available.
+
+        Args:
+            export_path: Full path to the ZIP backup file
+            resource_type: Resource type ('dashboard', 'chart', 'dataset')
+            overwrite: If True, overwrite existing resources with same IDs
+                       (default: True)
+        """
+        from pathlib import Path as _Path
+
+        backup = _Path(export_path)
+        if not backup.exists():
+            raise ValueError(f"Backup file not found: {export_path}")
+
+        ws = _get_ws()
+        data = backup.read_bytes()
+        result = ws.import_resource_zip(resource_type, data, overwrite=overwrite)
+        _log.info(
+            "restore_from_backup type=%s path=%s overwrite=%s",
+            resource_type, export_path, overwrite,
+        )
+
+        record_mutation(MutationEntry(
+            tool_name="restore_from_backup",
+            resource_type=resource_type,
+            action="restore",
+            after_summary={
+                "export_path": export_path,
+                "overwrite": overwrite,
+                "success": result,
+            },
+        ))
+
+        return json.dumps({
+            "status": "restored",
+            "resource_type": resource_type,
+            "export_path": export_path,
+            "overwrite": overwrite,
+            "success": result,
+        }, indent=2)
 
 
 # ===================================================================
