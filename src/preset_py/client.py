@@ -142,6 +142,10 @@ class PresetWorkspace:
     def databases(self, **filters: Any) -> list[dict[str, Any]]:
         return self._client.get_databases(**filters)
 
+    def get_resource(self, resource_type: str, resource_id: int) -> dict[str, Any]:
+        """Fetch a single resource by type and ID."""
+        return self._client.get_resource(resource_type, resource_id)
+
     def dashboard_detail(self, dashboard_id: int) -> dict[str, Any]:
         return self._client.get_dashboard(dashboard_id)
 

@@ -1,6 +1,6 @@
 [project]
 name = "preset-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for Preset (Superset) — manage dashboards, charts, and datasets from Claude Code and other LLM agents"
 readme = "README.md"
 license = "MIT"

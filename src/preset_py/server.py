@@ -37,6 +37,13 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from preset_py.client import PresetWorkspace, connect
+from preset_py._safety import (
+    MutationEntry,
+    capture_before,
+    check_dataset_dependents,
+    record_mutation,
+    validate_params_json,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via PRESET_MCP_* env vars)
@@ -619,6 +626,7 @@ def run_sql(
 def create_dashboard(
     dashboard_title: str,
     published: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Create a new, empty dashboard.
 
@@ -628,10 +636,38 @@ def create_dashboard(
     Args:
         dashboard_title: Display title for the dashboard
         published: Whether the dashboard is published (default: False)
+        dry_run: If True, validate inputs and return a preview without
+                 making any changes (default: False)
     """
+    if dry_run:
+        entry = MutationEntry(
+            tool_name="create_dashboard",
+            resource_type="dashboard",
+            action="create",
+            fields_changed=["dashboard_title", "published"],
+            dry_run=True,
+        )
+        record_mutation(entry)
+        return json.dumps({
+            "dry_run": True,
+            "action": "create_dashboard",
+            "fields_to_change": ["dashboard_title", "published"],
+            "values": {"dashboard_title": dashboard_title, "published": published},
+        }, indent=2)
+
     ws = _get_ws()
     result = ws.create_dashboard(dashboard_title, published=published)
     _log.info("create_dashboard title=%s id=%s", dashboard_title, result.get("id"))
+
+    record_mutation(MutationEntry(
+        tool_name="create_dashboard",
+        resource_type="dashboard",
+        resource_id=result.get("id"),
+        action="create",
+        fields_changed=["dashboard_title", "published"],
+        after_summary={"id": result.get("id"), "dashboard_title": dashboard_title},
+    ))
+
     return json.dumps(result, indent=2, default=str)
 
 
@@ -642,6 +678,7 @@ def create_dataset(
     sql: str,
     database_id: int,
     schema: str | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Create a virtual (SQL-based) dataset for charting.
 
@@ -649,15 +686,53 @@ def create_dataset(
     Take a validated SQL query (e.g. from igloo-mcp) and register it
     as a Preset dataset.  Use list_databases to find database_id.
 
+    Write SQL (INSERT, DROP, etc.) is blocked — only SELECT-style
+    queries are permitted as dataset definitions.
+
     Args:
         name: Display name for the dataset
         sql: SQL query defining the dataset
         database_id: Database connection ID
         schema: Optional schema name
+        dry_run: If True, validate inputs and return a preview without
+                 making any changes (default: False)
     """
+    _validate_readonly(sql)
+
+    if dry_run:
+        entry = MutationEntry(
+            tool_name="create_dataset",
+            resource_type="dataset",
+            action="create",
+            fields_changed=["name", "sql", "database_id", "schema"],
+            dry_run=True,
+        )
+        record_mutation(entry)
+        return json.dumps({
+            "dry_run": True,
+            "action": "create_dataset",
+            "fields_to_change": ["name", "sql", "database_id", "schema"],
+            "values": {
+                "name": name,
+                "sql": sql,
+                "database_id": database_id,
+                "schema": schema,
+            },
+        }, indent=2)
+
     ws = _get_ws()
     result = ws.create_dataset(name, sql, database_id, schema=schema)
     _log.info("create_dataset name=%s id=%s", name, result.get("id"))
+
+    record_mutation(MutationEntry(
+        tool_name="create_dataset",
+        resource_type="dataset",
+        resource_id=result.get("id"),
+        action="create",
+        fields_changed=["name", "sql", "database_id", "schema"],
+        after_summary={"id": result.get("id"), "name": name},
+    ))
+
     return json.dumps(result, indent=2, default=str)
 
 
@@ -671,6 +746,7 @@ def create_chart(
     groupby: list[str] | None = None,
     time_column: str | None = None,
     dashboards: list[int] | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Create a chart from an existing dataset.
 
@@ -687,7 +763,43 @@ def create_chart(
         groupby: Columns to group by
         time_column: Time column for time-series charts
         dashboards: Dashboard IDs to attach this chart to
+        dry_run: If True, validate inputs and return a preview without
+                 making any changes (default: False)
     """
+    fields = ["dataset_id", "title", "viz_type"]
+    if metrics is not None:
+        fields.append("metrics")
+    if groupby is not None:
+        fields.append("groupby")
+    if time_column is not None:
+        fields.append("time_column")
+    if dashboards is not None:
+        fields.append("dashboards")
+
+    if dry_run:
+        entry = MutationEntry(
+            tool_name="create_chart",
+            resource_type="chart",
+            action="create",
+            fields_changed=fields,
+            dry_run=True,
+        )
+        record_mutation(entry)
+        return json.dumps({
+            "dry_run": True,
+            "action": "create_chart",
+            "fields_to_change": fields,
+            "values": {
+                "dataset_id": dataset_id,
+                "title": title,
+                "viz_type": viz_type,
+                "metrics": metrics,
+                "groupby": groupby,
+                "time_column": time_column,
+                "dashboards": dashboards,
+            },
+        }, indent=2)
+
     ws = _get_ws()
     result = ws.create_chart(
         dataset_id,
@@ -699,6 +811,16 @@ def create_chart(
         dashboards=dashboards,
     )
     _log.info("create_chart title=%s id=%s", title, result.get("id"))
+
+    record_mutation(MutationEntry(
+        tool_name="create_chart",
+        resource_type="chart",
+        resource_id=result.get("id"),
+        action="create",
+        fields_changed=fields,
+        after_summary={"id": result.get("id"), "title": title},
+    ))
+
     return json.dumps(result, indent=2, default=str)
 
 
@@ -715,6 +837,7 @@ def update_dataset(
     name: str | None = None,
     description: str | None = None,
     override_columns: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Update an existing dataset's SQL, name, or description.
 
@@ -729,6 +852,9 @@ def update_dataset(
         description: New description
         override_columns: If True, refresh column metadata from the
                           new SQL (recommended when changing SQL)
+        dry_run: If True, validate inputs, capture current state, and
+                 check dependencies without making any changes
+                 (default: False)
     """
     kwargs: dict[str, Any] = {}
     if sql is not None:
@@ -744,11 +870,64 @@ def update_dataset(
         )
 
     ws = _get_ws()
+
+    # Pre-mutation snapshot
+    before = capture_before(ws, "dataset", dataset_id)
+
+    # Dependency check when SQL changes or columns are overridden
+    dependency_impact: dict[str, Any] | None = None
+    if sql is not None or override_columns:
+        dependency_impact = check_dataset_dependents(ws, dataset_id)
+
+    if dry_run:
+        entry = MutationEntry(
+            tool_name="update_dataset",
+            resource_type="dataset",
+            resource_id=dataset_id,
+            action="update",
+            fields_changed=list(kwargs.keys()),
+            before_snapshot=before,
+            dry_run=True,
+        )
+        record_mutation(entry)
+        preview: dict[str, Any] = {
+            "dry_run": True,
+            "action": "update_dataset",
+            "dataset_id": dataset_id,
+            "fields_to_change": list(kwargs.keys()),
+            "current_state": before,
+        }
+        if dependency_impact:
+            preview["dependency_impact"] = dependency_impact
+        return json.dumps(preview, indent=2, default=str)
+
     result = ws.update_dataset(
         dataset_id, override_columns=override_columns, **kwargs
     )
     _log.info("update_dataset id=%d fields=%s", dataset_id, list(kwargs.keys()))
-    return json.dumps(result, indent=2, default=str)
+
+    record_mutation(MutationEntry(
+        tool_name="update_dataset",
+        resource_type="dataset",
+        resource_id=dataset_id,
+        action="update",
+        fields_changed=list(kwargs.keys()),
+        before_snapshot=before,
+        after_summary={"id": dataset_id, "fields_updated": list(kwargs.keys())},
+    ))
+
+    # Attach advisory info to the response
+    response = result if isinstance(result, dict) else {"result": result}
+    if dependency_impact:
+        response["_dependency_impact"] = dependency_impact
+    if override_columns and dependency_impact and dependency_impact.get("chart_count", 0) > 0:
+        response["_override_columns_warning"] = (
+            f"override_columns=True will refresh column metadata. "
+            f"{dependency_impact['chart_count']} chart(s) may be affected: "
+            f"{[c['name'] for c in dependency_impact.get('affected_charts', [])]}"
+        )
+
+    return json.dumps(response, indent=2, default=str)
 
 
 @mcp.tool()
@@ -759,6 +938,7 @@ def update_chart(
     viz_type: str | None = None,
     params_json: str | None = None,
     dashboards: list[int] | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Update an existing chart's title, viz type, or parameters.
 
@@ -773,7 +953,14 @@ def update_chart(
         params_json: JSON string of chart parameters (advanced — use
                      get_dashboard to inspect existing chart params first)
         dashboards: Reassign chart to these dashboard IDs
+        dry_run: If True, validate inputs, capture current state, and
+                 return a preview without making any changes
+                 (default: False)
     """
+    # Validate params_json before building kwargs
+    if params_json is not None:
+        validate_params_json(params_json)
+
     kwargs: dict[str, Any] = {}
     if title is not None:
         kwargs["slice_name"] = title
@@ -791,8 +978,42 @@ def update_chart(
         )
 
     ws = _get_ws()
+
+    # Pre-mutation snapshot
+    before = capture_before(ws, "chart", chart_id)
+
+    if dry_run:
+        entry = MutationEntry(
+            tool_name="update_chart",
+            resource_type="chart",
+            resource_id=chart_id,
+            action="update",
+            fields_changed=list(kwargs.keys()),
+            before_snapshot=before,
+            dry_run=True,
+        )
+        record_mutation(entry)
+        return json.dumps({
+            "dry_run": True,
+            "action": "update_chart",
+            "chart_id": chart_id,
+            "fields_to_change": list(kwargs.keys()),
+            "current_state": before,
+        }, indent=2, default=str)
+
     result = ws.update_chart(chart_id, **kwargs)
     _log.info("update_chart id=%d fields=%s", chart_id, list(kwargs.keys()))
+
+    record_mutation(MutationEntry(
+        tool_name="update_chart",
+        resource_type="chart",
+        resource_id=chart_id,
+        action="update",
+        fields_changed=list(kwargs.keys()),
+        before_snapshot=before,
+        after_summary={"id": chart_id, "fields_updated": list(kwargs.keys())},
+    ))
+
     return json.dumps(result, indent=2, default=str)
 
 
@@ -802,6 +1023,7 @@ def update_dashboard(
     dashboard_id: int,
     dashboard_title: str | None = None,
     published: bool | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Update an existing dashboard's title or published status.
 
@@ -811,6 +1033,9 @@ def update_dashboard(
         dashboard_id: ID of the dashboard to update
         dashboard_title: New dashboard title
         published: Set to True to publish, False to unpublish
+        dry_run: If True, validate inputs, capture current state, and
+                 return a preview without making any changes
+                 (default: False)
     """
     kwargs: dict[str, Any] = {}
     if dashboard_title is not None:
@@ -825,8 +1050,42 @@ def update_dashboard(
         )
 
     ws = _get_ws()
+
+    # Pre-mutation snapshot
+    before = capture_before(ws, "dashboard", dashboard_id)
+
+    if dry_run:
+        entry = MutationEntry(
+            tool_name="update_dashboard",
+            resource_type="dashboard",
+            resource_id=dashboard_id,
+            action="update",
+            fields_changed=list(kwargs.keys()),
+            before_snapshot=before,
+            dry_run=True,
+        )
+        record_mutation(entry)
+        return json.dumps({
+            "dry_run": True,
+            "action": "update_dashboard",
+            "dashboard_id": dashboard_id,
+            "fields_to_change": list(kwargs.keys()),
+            "current_state": before,
+        }, indent=2, default=str)
+
     result = ws.update_dashboard(dashboard_id, **kwargs)
     _log.info("update_dashboard id=%d fields=%s", dashboard_id, list(kwargs.keys()))
+
+    record_mutation(MutationEntry(
+        tool_name="update_dashboard",
+        resource_type="dashboard",
+        resource_id=dashboard_id,
+        action="update",
+        fields_changed=list(kwargs.keys()),
+        before_snapshot=before,
+        after_summary={"id": dashboard_id, "fields_updated": list(kwargs.keys())},
+    ))
+
     return json.dumps(result, indent=2, default=str)
 
 
