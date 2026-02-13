@@ -7,7 +7,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
@@ -36,7 +36,7 @@ class MutationEntry(BaseModel):
     tool_name: str
     resource_type: str  # "dashboard", "chart", "dataset"
     resource_id: int | None = None
-    action: str  # "create" or "update"
+    action: Literal["create", "update", "delete", "restore"]
     fields_changed: list[str] = Field(default_factory=list)
     before_snapshot: dict[str, Any] | None = None
     after_summary: dict[str, Any] | None = None
@@ -175,3 +175,26 @@ def validate_params_json(params_json: str) -> dict[str, Any]:
         )
 
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# Pre-delete export (mandatory, blocking)
+# ---------------------------------------------------------------------------
+
+
+def export_before_delete(
+    ws: PresetWorkspace,
+    resource_type: str,
+    resource_id: int,
+) -> Path:
+    """Export a full ZIP backup before deletion. BLOCKING — raises on failure."""
+    exports_dir = AUDIT_DIR / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    export_path = exports_dir / f"{resource_type}_{resource_id}_{ts}.zip"
+
+    zip_bytes = ws.export_resource_zip(resource_type, [resource_id])
+    export_path.write_bytes(zip_bytes)
+
+    _log.info("pre-delete export saved: %s (%d bytes)", export_path, len(zip_bytes))
+    return export_path
