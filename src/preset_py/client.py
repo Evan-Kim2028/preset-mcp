@@ -416,6 +416,10 @@ class PresetWorkspace:
     def dashboard_detail(self, dashboard_id: int) -> dict[str, Any]:
         return self._client.get_dashboard(dashboard_id)
 
+    def chart_detail(self, chart_id: int) -> dict[str, Any]:
+        """Fetch full detail for a single chart (params, query_context, datasource)."""
+        return self._client.get_chart(chart_id)
+
     def dashboard_charts(self, dashboard_id: int) -> list[dict[str, Any]]:
         """Get chart definitions for one dashboard (includes form_data)."""
         response = self._client.session.get(

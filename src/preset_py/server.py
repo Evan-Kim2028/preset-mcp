@@ -553,6 +553,22 @@ def get_dashboard(dashboard_id: int) -> str:
 
 @mcp.tool()
 @_handle_errors
+def get_chart(chart_id: int) -> str:
+    """Get full detail for a single chart including params and query context.
+
+    Returns the chart's visualization type, parameters, query_context,
+    datasource info, and other metadata.  Use list_charts first to find
+    valid IDs.
+
+    Args:
+        chart_id: Numeric chart ID
+    """
+    ws = _get_ws()
+    return json.dumps(ws.chart_detail(chart_id), indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
 def list_charts(response_mode: ResponseMode = "standard") -> str:
     """List charts in the current workspace.
 
@@ -1088,7 +1104,7 @@ def update_chart(
         title: New chart title
         viz_type: New visualization type
         params_json: JSON string of chart parameters (advanced — use
-                     get_dashboard to inspect existing chart params first)
+                     get_chart to inspect existing chart params first)
         dashboards: Reassign chart to these dashboard IDs
         dry_run: If True, validate inputs, capture current state, and
                  return a preview without making any changes
