@@ -727,6 +727,122 @@ def run_sql(
 
 
 # ===================================================================
+# Tools — Validation
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def validate_chart(
+    chart_id: int,
+    dashboard_id: int | None = None,
+    row_limit: int = 10000,
+    force: bool = False,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Run chart query validation and return render status.
+
+    This validates the saved chart params against chart-data execution, returning
+    actionable errors for missing metrics/columns/etc.
+
+    Notes:
+      - This does not take a screenshot; it executes the same query context
+        used for chart rendering.
+      - `dashboard_id` speeds lookup of chart form_data. If omitted, all
+        dashboards are scanned.
+
+    Args:
+        chart_id: Chart ID to validate
+        dashboard_id: Optional dashboard context for form_data lookup
+        row_limit: Query row limit used for validation
+        force: Whether to force recomputation (if supported by backend)
+        response_mode: 'compact' (small summary), 'standard' (default),
+                       or 'full' (raw payload + metadata)
+    """
+    ws = _get_ws()
+    result = ws.validate_chart_data(
+        chart_id,
+        dashboard_id=dashboard_id,
+        row_limit=row_limit,
+        force=force,
+    )
+    if response_mode == "compact":
+        status = result.get("status")
+        return json.dumps({
+            "chart_id": result.get("chart_id"),
+            "slice_name": result.get("slice_name"),
+            "dashboard_id": result.get("dashboard_id"),
+            "status": status,
+            "error": result.get("error"),
+        }, indent=2, default=str)
+    if response_mode == "standard":
+        return json.dumps({
+            "chart_id": result.get("chart_id"),
+            "slice_name": result.get("slice_name"),
+            "dashboard_id": result.get("dashboard_id"),
+            "datasource": result.get("datasource"),
+            "status": result.get("status"),
+            "error": result.get("error"),
+            "row_count": result.get("row_count"),
+            "cache_key": result.get("cache_key"),
+            "is_cached": result.get("is_cached"),
+            "http_status": result.get("http_status"),
+        }, indent=2, default=str)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def validate_dashboard(
+    dashboard_id: int,
+    row_limit: int = 10000,
+    force: bool = False,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Validate all charts on a dashboard and return aggregate statuses."""
+    ws = _get_ws()
+    result = ws.validate_dashboard_charts(
+        dashboard_id,
+        row_limit=row_limit,
+        force=force,
+    )
+
+    if response_mode == "compact":
+        errors = [
+            r for r in result["results"]
+            if r.get("error") is not None
+            or (r.get("status") and r.get("status") != "success")
+        ]
+        return json.dumps({
+            "dashboard_id": result["dashboard_id"],
+            "chart_count": result["chart_count"],
+            "validated": result["validated"],
+            "broken_count": len(errors),
+            "broken_charts": errors,
+        }, indent=2, default=str)
+
+    if response_mode == "standard":
+        summary = {
+            "dashboard_id": result["dashboard_id"],
+            "chart_count": result["chart_count"],
+            "validated": result["validated"],
+            "results": [
+                {
+                    "chart_id": item.get("chart_id"),
+                    "slice_name": item.get("slice_name"),
+                    "status": item.get("status"),
+                    "row_count": item.get("row_count"),
+                    "cache_key": item.get("cache_key"),
+                    "error": item.get("error"),
+                }
+                for item in result.get("results", [])
+            ],
+        }
+        return json.dumps(summary, indent=2, default=str)
+    return json.dumps(result, indent=2, default=str)
+
+
+# ===================================================================
 # Tools — Create operations
 # ===================================================================
 
@@ -1018,16 +1134,27 @@ def update_dashboard(
     dashboard_id: int,
     dashboard_title: str | None = None,
     published: bool | None = None,
+    position_json: str | None = None,
+    json_metadata: str | None = None,
     dry_run: bool = False,
 ) -> str:
-    """Update an existing dashboard's title or published status.
+    """Update an existing dashboard's properties.
 
     Use list_dashboards to find the dashboard_id.
+    Use get_dashboard to inspect the current position_json and json_metadata.
 
     Args:
         dashboard_id: ID of the dashboard to update
         dashboard_title: New dashboard title
         published: Set to True to publish, False to unpublish
+        position_json: JSON string defining the dashboard layout (chart
+            containers, rows, grid). Use this to add, remove, or
+            rearrange chart containers — e.g. after deleting charts
+            whose containers remain as orphaned placeholders.
+        json_metadata: JSON string with dashboard metadata (cross-filter
+            config, color schemes, label colors, refresh settings).
+            Update this alongside position_json to keep chart references
+            in sync.
         dry_run: If True, validate inputs, capture current state, and
                  return a preview without making any changes
                  (default: False)
@@ -1037,11 +1164,15 @@ def update_dashboard(
         kwargs["dashboard_title"] = dashboard_title
     if published is not None:
         kwargs["published"] = published
+    if position_json is not None:
+        kwargs["position_json"] = position_json
+    if json_metadata is not None:
+        kwargs["json_metadata"] = json_metadata
 
     if not kwargs:
         raise ValueError(
             "Provide at least one field to update "
-            "(dashboard_title or published)."
+            "(dashboard_title, published, position_json, or json_metadata)."
         )
 
     ws = _get_ws()

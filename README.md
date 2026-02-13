@@ -63,7 +63,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
   preset-mcp -- uv run --directory /path/to/preset-mcp preset-mcp
 ```
 
-## Tools (16)
+## Tools (18)
 
 ### Workspace Navigation
 
@@ -105,6 +105,8 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 |------|---------|
 | `run_sql` | Execute a read-only query through Preset's connection |
 | `snapshot_workspace` | Full inventory dump for auditing |
+| `validate_chart` | Validate a single chart via chart-data execution |
+| `validate_dashboard` | Validate all charts on a dashboard |
 
 ## Typical Workflow
 
