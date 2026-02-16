@@ -142,16 +142,108 @@ _FORBIDDEN_PARAM_KEYS = frozenset({
     "datasource_id",
     "datasource_type",
     "database_id",
+    "viz_type",
 })
 
+def _metric_column_name(metric: dict[str, Any]) -> str | None:
+    """Extract a metric's referenced column name, if present."""
+    column = metric.get("column")
+    if isinstance(column, str):
+        return column
+    if isinstance(column, dict):
+        name = column.get("column_name") or column.get("name")
+        if isinstance(name, str):
+            return name
+    return None
 
-def validate_params_json(params_json: str) -> dict[str, Any]:
-    """Parse and validate a params_json string for update_chart.
 
-    Raises ``ValueError`` on:
-      - Invalid JSON
-      - Non-dict input
-      - Keys that would rebind the chart's datasource
+def _validate_metric_object(metric: dict[str, Any], index: int) -> str | None:
+    """Validate a metric object and return an optional referenced column."""
+    expression_type = metric.get("expressionType")
+    if expression_type is not None and not isinstance(expression_type, str):
+        raise ValueError(
+            f"metrics[{index}].expressionType must be a string when provided."
+        )
+
+    if expression_type == "SIMPLE":
+        if not metric.get("aggregate"):
+            raise ValueError(
+                f"metrics[{index}] uses SIMPLE expressionType but has no aggregate."
+            )
+        col_name = _metric_column_name(metric)
+        if not col_name:
+            raise ValueError(
+                f"metrics[{index}] uses SIMPLE expressionType but has no valid column."
+            )
+        return col_name
+
+    if expression_type == "SQL":
+        sql_expr = metric.get("sqlExpression")
+        if not isinstance(sql_expr, str) or not sql_expr.strip():
+            raise ValueError(
+                f"metrics[{index}] uses SQL expressionType but sqlExpression is missing."
+            )
+        return None
+
+    # Be permissive for legacy-style metric dicts so we don't reject valid
+    # Superset payloads that omit expressionType.
+    if expression_type is None:
+        if metric.get("sqlExpression"):
+            return None
+        if metric.get("aggregate") and _metric_column_name(metric):
+            return _metric_column_name(metric)
+        if metric.get("metric_name") or metric.get("label") or metric.get("optionName"):
+            return None
+        raise ValueError(
+            f"metrics[{index}] is a dict but missing metric structure. "
+            "Expected saved metric reference or SIMPLE/SQL metric object."
+        )
+
+    raise ValueError(
+        f"metrics[{index}] has unsupported expressionType={expression_type!r}."
+    )
+
+
+def _extract_filter_columns(filters: Any) -> set[str]:
+    """Extract column references from filters/adhoc_filters payloads."""
+    refs: set[str] = set()
+    if not isinstance(filters, list):
+        return refs
+    for item in filters:
+        if not isinstance(item, dict):
+            continue
+        for key in ("col", "subject", "column"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                refs.add(value)
+        if isinstance(item.get("column"), dict):
+            col_name = item["column"].get("column_name")
+            if isinstance(col_name, str) and col_name:
+                refs.add(col_name)
+    return refs
+
+
+def _extract_named_columns(value: Any) -> set[str]:
+    """Extract string column names from list-like params entries."""
+    refs: set[str] = set()
+    if not isinstance(value, list):
+        return refs
+    for item in value:
+        if isinstance(item, str) and item:
+            refs.add(item)
+    return refs
+
+
+def validate_params_payload(
+    params_json: str,
+    *,
+    dataset_columns: set[str] | None = None,
+    dataset_metrics: set[str] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Parse + validate params_json and return advisory warnings.
+
+    Raises ``ValueError`` on malformed JSON, forbidden keys, or invalid
+    metric structures. Returns ``(parsed_params, warnings)`` on success.
     """
     try:
         parsed = json.loads(params_json)
@@ -174,6 +266,57 @@ def validate_params_json(params_json: str) -> dict[str, Any]:
             f"{sorted(forbidden_found)}. Use the dedicated tool parameters instead."
         )
 
+    warnings: list[str] = []
+    dataset_columns = dataset_columns or set()
+    dataset_metrics = dataset_metrics or set()
+
+    metrics = parsed.get("metrics")
+    metric_column_refs: set[str] = set()
+    if metrics is not None:
+        if not isinstance(metrics, list):
+            raise ValueError("params_json.metrics must be a list.")
+        for idx, metric in enumerate(metrics):
+            if isinstance(metric, str):
+                if (
+                    dataset_columns
+                    and dataset_metrics
+                    and metric not in dataset_metrics
+                    and metric not in dataset_columns
+                ):
+                    warnings.append(
+                        f"metrics[{idx}] references unknown metric/column {metric!r}."
+                    )
+                continue
+            if isinstance(metric, dict):
+                ref = _validate_metric_object(metric, idx)
+                if ref:
+                    metric_column_refs.add(ref)
+                continue
+            raise ValueError(
+                f"metrics[{idx}] must be a string or metric object dict."
+            )
+
+    referenced_columns: set[str] = set()
+    referenced_columns.update(_extract_named_columns(parsed.get("groupby")))
+    referenced_columns.update(_extract_named_columns(parsed.get("columns")))
+    referenced_columns.update(_extract_filter_columns(parsed.get("filters")))
+    referenced_columns.update(_extract_filter_columns(parsed.get("adhoc_filters")))
+    referenced_columns.update(metric_column_refs)
+
+    if dataset_columns and referenced_columns:
+        missing = sorted(col for col in referenced_columns if col not in dataset_columns)
+        if missing:
+            warnings.append(
+                "params_json references unknown dataset columns: "
+                f"{missing}."
+            )
+
+    return parsed, warnings
+
+
+def validate_params_json(params_json: str) -> dict[str, Any]:
+    """Backward-compatible validator returning only parsed params."""
+    parsed, _ = validate_params_payload(params_json)
     return parsed
 
 

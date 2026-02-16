@@ -47,10 +47,103 @@ def _create_virtual_dataset(
     if dataset_id:
         try:
             client.get_refreshed_dataset_columns(dataset_id)
-        except Exception:
-            pass  # non-fatal; columns will refresh on first use
+        except Exception as exc:
+            # Surface degraded-state warning instead of silently swallowing it.
+            result["_warning"] = (
+                "Dataset created but column refresh failed: "
+                f"{exc}. Columns may not be available until first query."
+            )
 
     return result
+
+
+def _column_map(dataset: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Build column_name -> column dict mapping from a dataset payload."""
+    columns = dataset.get("columns", [])
+    if not isinstance(columns, list):
+        return {}
+    mapped: dict[str, dict[str, Any]] = {}
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("column_name")
+        if isinstance(name, str) and name:
+            mapped[name] = column
+    return mapped
+
+
+def _column_type_name(column: dict[str, Any]) -> str:
+    """Return a normalized type name from dataset column metadata."""
+    for key in ("type", "type_generic", "python_date_format"):
+        raw = column.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip().upper()
+    return ""
+
+
+def _is_numeric_column(column: dict[str, Any]) -> bool:
+    """Best-effort numeric column detection from Superset metadata."""
+    type_name = _column_type_name(column)
+    numeric_tokens = (
+        "INT", "NUMBER", "NUMERIC", "DECIMAL", "FLOAT", "DOUBLE",
+        "REAL", "BIGINT", "SMALLINT", "TINYINT",
+    )
+    return any(token in type_name for token in numeric_tokens)
+
+
+def _simple_metric_from_column(column_name: str, column: dict[str, Any]) -> dict[str, Any]:
+    """Build a renderable SIMPLE metric object from a dataset column."""
+    aggregate = "SUM" if _is_numeric_column(column) else "COUNT"
+    return {
+        "expressionType": "SIMPLE",
+        "column": {
+            "column_name": column_name,
+            "type": column.get("type"),
+        },
+        "aggregate": aggregate,
+        "label": f"{aggregate}({column_name})",
+        "optionName": f"metric_{aggregate.lower()}_{column_name}",
+    }
+
+
+def _normalize_create_metrics(
+    metrics: list[Any],
+    dataset: dict[str, Any],
+) -> list[Any]:
+    """Normalize string metrics to Superset-compatible metric definitions."""
+    dataset_metric_names = _dataset_metric_names(dataset)
+    columns = _column_map(dataset)
+
+    normalized: list[Any] = []
+    for metric in metrics:
+        if isinstance(metric, dict):
+            normalized.append(metric)
+            continue
+
+        metric_name = str(metric)
+        if metric_name in dataset_metric_names:
+            normalized.append(metric_name)
+            continue
+
+        column = columns.get(metric_name)
+        if column is None:
+            raise ValueError(
+                f"Unknown metric {metric_name!r}. Provide a saved metric name "
+                "or a dataset column name."
+            )
+        normalized.append(_simple_metric_from_column(metric_name, column))
+    return normalized
+
+
+def _validate_groupby_columns(groupby: list[str], dataset: dict[str, Any]) -> None:
+    """Fail fast when groupby references missing dataset columns."""
+    columns = set(_column_map(dataset).keys())
+    missing = [col for col in groupby if col not in columns]
+    if missing:
+        raise ValueError(
+            f"groupby contains unknown column(s): {missing}. "
+            "Use get_dataset(..., response_mode='standard') to inspect valid columns."
+        )
 
 
 def _create_chart(
@@ -59,7 +152,7 @@ def _create_chart(
     title: str,
     viz_type: str,
     *,
-    metrics: list[str] | None = None,
+    metrics: list[Any] | None = None,
     groupby: list[str] | None = None,
     time_column: str | None = None,
     dashboards: list[int] | None = None,
@@ -70,12 +163,20 @@ def _create_chart(
     ``extra_params`` is merged into the chart params dict, allowing callers
     to pass any viz-type-specific options.
     """
+    dataset = client.get_dataset(dataset_id)
+
     params: dict[str, Any] = {
         "viz_type": viz_type,
+        "datasource": f"{dataset_id}__table",
+        "row_limit": 10000,
+        "color_scheme": "supersetColors",
+        "show_legend": True,
+        "adhoc_filters": [],
     }
     if metrics:
-        params["metrics"] = metrics
+        params["metrics"] = _normalize_create_metrics(metrics, dataset)
     if groupby:
+        _validate_groupby_columns(groupby, dataset)
         params["groupby"] = groupby
     if time_column:
         params["granularity_sqla"] = time_column
@@ -420,6 +521,15 @@ class PresetWorkspace:
         """Fetch full detail for a single chart (params, query_context, datasource)."""
         return self._client.get_chart(chart_id)
 
+    def dataset_detail(self, dataset_id: int) -> dict[str, Any]:
+        return self._client.get_dataset(dataset_id)
+
+    def database_detail(self, database_id: int) -> dict[str, Any]:
+        return self._client.get_database(database_id)
+
+    def refresh_dataset_columns(self, dataset_id: int) -> list[Any]:
+        return self._client.get_refreshed_dataset_columns(dataset_id)
+
     def dashboard_charts(self, dashboard_id: int) -> list[dict[str, Any]]:
         """Get chart definitions for one dashboard (includes form_data)."""
         response = self._client.session.get(
@@ -667,6 +777,44 @@ class PresetWorkspace:
             database_id=database_id, sql=sql, schema=schema, limit=limit
         )
 
+    def query_dataset(
+        self,
+        dataset_id: int,
+        metrics: list[str],
+        columns: list[str] | None = None,
+        order_by: list[str] | None = None,
+        order_desc: bool = True,
+        is_timeseries: bool = False,
+        time_column: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        granularity: str | None = None,
+        where: str = "",
+        having: str = "",
+        row_limit: int = 10000,
+        force: bool = False,
+    ) -> pd.DataFrame:
+        from datetime import datetime
+
+        start_dt = datetime.fromisoformat(start) if start else None
+        end_dt = datetime.fromisoformat(end) if end else None
+        return self._client.get_data(
+            dataset_id=dataset_id,
+            metrics=metrics,
+            columns=columns or [],
+            order_by=order_by,
+            order_desc=order_desc,
+            is_timeseries=is_timeseries,
+            time_column=time_column,
+            start=start_dt,
+            end=end_dt,
+            granularity=granularity,
+            where=where,
+            having=having,
+            row_limit=row_limit,
+            force=force,
+        )
+
     # ------------------------------------------------------------------
     # Create helpers
     # ------------------------------------------------------------------
@@ -688,7 +836,7 @@ class PresetWorkspace:
         title: str,
         viz_type: str,
         *,
-        metrics: list[str] | None = None,
+        metrics: list[Any] | None = None,
         groupby: list[str] | None = None,
         time_column: str | None = None,
         dashboards: list[int] | None = None,

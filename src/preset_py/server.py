@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import time
+from difflib import get_close_matches
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -38,6 +39,8 @@ from sqlglot import exp as E
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from preset_cli.api.operators import OneToMany
+
 from preset_py.client import PresetWorkspace, connect
 from preset_py._safety import (
     AUDIT_DIR,
@@ -46,7 +49,7 @@ from preset_py._safety import (
     check_dataset_dependents,
     export_before_delete,
     record_mutation,
-    validate_params_json,
+    validate_params_payload,
 )
 
 # ---------------------------------------------------------------------------
@@ -116,6 +119,41 @@ _STANDARD: dict[str, list[str]] = {
 }
 
 # ---------------------------------------------------------------------------
+# Detail-view field sets (for get_* single-resource tools)
+# ---------------------------------------------------------------------------
+
+_DETAIL_COMPACT: dict[str, list[str]] = {
+    "dashboard": [
+        "id", "dashboard_title", "published", "status",
+        "orphaned_chart_refs",
+    ],
+    "chart": ["id", "slice_name", "viz_type", "datasource_id", "datasource_type"],
+    "dataset": ["id", "table_name", "schema", "database", "kind"],
+    "database": ["id", "database_name", "backend"],
+}
+
+_DETAIL_STANDARD: dict[str, list[str]] = {
+    "dashboard": [
+        "id", "dashboard_title", "published", "status",
+        "url", "slug", "owners", "changed_on",
+        "dashboard_health", "orphaned_chart_refs",
+    ],
+    "chart": [
+        "id", "slice_name", "viz_type", "datasource_id",
+        "datasource_type", "datasource_name_text",
+        "params", "changed_on", "owners",
+    ],
+    "dataset": [
+        "id", "table_name", "schema", "database", "kind", "sql",
+        "columns", "metrics", "changed_on", "owners",
+    ],
+    "database": [
+        "id", "database_name", "backend", "expose_in_sqllab",
+        "allow_dml", "configuration_method",
+    ],
+}
+
+# ---------------------------------------------------------------------------
 # Server + lazy state
 # ---------------------------------------------------------------------------
 
@@ -166,6 +204,20 @@ def _format_list(
     return json.dumps(out, indent=2, default=str)
 
 
+def _format_detail(record: dict, resource: str, mode: ResponseMode) -> str:
+    """Apply progressive disclosure to a single API record (detail view)."""
+    if mode == "compact":
+        data = {k: record[k] for k in _DETAIL_COMPACT.get(resource, []) if k in record}
+    elif mode == "standard":
+        data = {k: record[k] for k in _DETAIL_STANDARD.get(resource, []) if k in record}
+    else:
+        data = record
+    out: dict[str, Any] = {"response_mode": mode, "data": data}
+    if mode != "full":
+        out["hint"] = "Set response_mode='full' to see all fields."
+    return json.dumps(out, indent=2, default=str)
+
+
 def _format_sql(
     records: list[dict],
     columns: list[str],
@@ -210,6 +262,479 @@ def _format_sql(
             out["truncated"] = False
 
     return json.dumps(out, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Client-side name filter
+# ---------------------------------------------------------------------------
+
+_NAME_KEYS: dict[str, str] = {
+    "dashboard": "dashboard_title",
+    "chart": "slice_name",
+    "dataset": "table_name",
+    "database": "database_name",
+}
+
+
+def _filter_by_name(records: list[dict], resource: str, name_contains: str) -> list[dict]:
+    """Case-insensitive substring filter on the resource's name field."""
+    key = _NAME_KEYS.get(resource, "name")
+    needle = name_contains.lower()
+    return [r for r in records if needle in str(r.get(key, "")).lower()]
+
+
+# ---------------------------------------------------------------------------
+# Input coercion + validation helpers
+# ---------------------------------------------------------------------------
+
+_KNOWN_VIZ_TYPES = frozenset({
+    "area",
+    "big_number_total",
+    "dist_bar",
+    "echarts_area",
+    "echarts_bar",
+    "echarts_timeseries_area",
+    "echarts_timeseries_bar",
+    "echarts_timeseries_line",
+    "histogram_v2",
+    "line",
+    "mixed_timeseries",
+    "pie",
+    "pivot_table_v2",
+    "sankey_v2",
+    "sunburst_v2",
+    "table",
+    "treemap_v2",
+})
+
+_DISCOURAGED_VIZ_TYPES: dict[str, str] = {
+    # Legacy/deprecated aliases seen to fail in modern Preset workspaces.
+    "echarts_bar": "echarts_timeseries_bar",
+}
+
+
+def _to_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _ensure_json_dict(value: Any, field_name: str) -> dict[str, Any]:
+    """Parse dict-like JSON fields from dashboard payloads."""
+    if isinstance(value, dict):
+        return value
+    if value in (None, "", "{}"):
+        return {}
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field_name} is not valid JSON: {exc}") from exc
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError(f"{field_name} must be a JSON object.")
+    raise ValueError(f"{field_name} must be a dict or JSON object string.")
+
+
+def _coerce_list_arg(
+    value: list[Any] | tuple[Any, ...] | str | None,
+    *,
+    field_name: str,
+    item_kind: Literal["str", "int"],
+) -> list[Any] | None:
+    """Accept native list or JSON-string list for MCP arguments."""
+    if value is None:
+        return None
+
+    raw = value
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{field_name} must be a list or JSON array string (e.g. "
+                f"'[\"x\", \"y\"]'). Got {raw!r}."
+            ) from exc
+        raw = parsed
+
+    if isinstance(raw, tuple):
+        raw = list(raw)
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"{field_name} must be a list. Got {type(raw).__name__}."
+        )
+
+    normalized: list[Any] = []
+    for idx, item in enumerate(raw):
+        if item_kind == "str":
+            if item is None:
+                raise ValueError(f"{field_name}[{idx}] must not be null.")
+            normalized.append(str(item))
+            continue
+
+        parsed_int = _to_int(item)
+        if parsed_int is None:
+            raise ValueError(
+                f"{field_name}[{idx}] must be an integer. Got {item!r}."
+            )
+        normalized.append(parsed_int)
+    return normalized
+
+
+def _dataset_columns(dataset: dict[str, Any]) -> set[str]:
+    columns = dataset.get("columns", [])
+    if not isinstance(columns, list):
+        return set()
+    names: set[str] = set()
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("column_name") or column.get("name")
+        if isinstance(name, str):
+            names.add(name)
+    return names
+
+
+def _dataset_metrics(dataset: dict[str, Any]) -> set[str]:
+    metrics = dataset.get("metrics", [])
+    if not isinstance(metrics, list):
+        return set()
+    names: set[str] = set()
+    for metric in metrics:
+        if isinstance(metric, str):
+            names.add(metric)
+            continue
+        if not isinstance(metric, dict):
+            continue
+        for key in ("metric_name", "label", "name"):
+            value = metric.get(key)
+            if isinstance(value, str) and value:
+                names.add(value)
+                break
+    return names
+
+
+def _require_dataset_exists(ws: PresetWorkspace, dataset_id: int) -> None:
+    try:
+        ws.dataset_detail(dataset_id)
+    except Exception as exc:
+        raise ValueError(
+            f"Dataset {dataset_id} not found. Use list_datasets to find valid IDs."
+        ) from exc
+
+
+def _require_chart_exists(ws: PresetWorkspace, chart_id: int) -> None:
+    try:
+        ws.chart_detail(chart_id)
+    except Exception as exc:
+        raise ValueError(
+            f"Chart {chart_id} not found. Use list_charts to find valid IDs."
+        ) from exc
+
+
+def _require_database_exists(ws: PresetWorkspace, database_id: int) -> None:
+    try:
+        ws.database_detail(database_id)
+    except Exception as exc:
+        raise ValueError(
+            f"Database {database_id} not found. Use list_databases to find valid IDs."
+        ) from exc
+
+
+def _require_dashboards_exist(ws: PresetWorkspace, dashboard_ids: list[int]) -> None:
+    for dashboard_id in dashboard_ids:
+        try:
+            ws.dashboard_detail(dashboard_id)
+        except Exception as exc:
+            raise ValueError(
+                f"Dashboard {dashboard_id} not found. Use list_dashboards to find valid IDs."
+            ) from exc
+
+
+def _collect_workspace_viz_types(ws: PresetWorkspace) -> set[str]:
+    viz_types = set(_KNOWN_VIZ_TYPES)
+    try:
+        for chart in ws.charts():
+            viz = chart.get("viz_type")
+            if isinstance(viz, str) and viz:
+                viz_types.add(viz)
+    except Exception:
+        # Non-blocking fallback to curated defaults.
+        pass
+    return viz_types
+
+
+def _validate_viz_type(ws: PresetWorkspace, viz_type: str) -> None:
+    if viz_type in _DISCOURAGED_VIZ_TYPES:
+        replacement = _DISCOURAGED_VIZ_TYPES[viz_type]
+        raise ValueError(
+            f"viz_type {viz_type!r} is discouraged/legacy. "
+            f"Use {replacement!r} instead."
+        )
+
+    allowed = _collect_workspace_viz_types(ws)
+    if viz_type in allowed:
+        return
+
+    suggestions = get_close_matches(viz_type, sorted(allowed), n=5, cutoff=0.55)
+    msg = (
+        f"Unsupported viz_type {viz_type!r}. "
+        "Use list_charts(...) to inspect known viz types in this workspace."
+    )
+    if suggestions:
+        msg += f" Suggestions: {suggestions}."
+    raise ValueError(msg)
+
+
+def _parse_chart_datasource_from_params(params_value: Any) -> tuple[int | None, str | None]:
+    try:
+        params = _ensure_json_dict(params_value, "chart params")
+    except ValueError:
+        return None, None
+    datasource = params.get("datasource")
+    if isinstance(datasource, str) and "__" in datasource:
+        raw_id, ds_type = datasource.split("__", 1)
+        ds_id = _to_int(raw_id)
+        return ds_id, ds_type or "table"
+    if isinstance(datasource, dict):
+        return _to_int(datasource.get("id")), str(datasource.get("type", "table"))
+    return None, None
+
+
+def _parse_chart_datasource_from_query_context(value: Any) -> tuple[int | None, str | None]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None, None
+    if not isinstance(value, dict):
+        return None, None
+    datasource = value.get("datasource")
+    if isinstance(datasource, dict):
+        return _to_int(datasource.get("id")), str(datasource.get("type", "table"))
+    return None, None
+
+
+def _enrich_chart_datasource_fields(ws: PresetWorkspace, chart: dict[str, Any]) -> dict[str, Any]:
+    """Backfill datasource_* fields missing from chart detail endpoint."""
+    enriched = dict(chart)
+    ds_id = _to_int(enriched.get("datasource_id"))
+    ds_type = enriched.get("datasource_type")
+    ds_name = enriched.get("datasource_name_text") or enriched.get("datasource_name")
+
+    if ds_id is None or not ds_type:
+        id_from_params, type_from_params = _parse_chart_datasource_from_params(
+            enriched.get("params", {})
+        )
+        if ds_id is None:
+            ds_id = id_from_params
+        if not ds_type:
+            ds_type = type_from_params
+
+    if ds_id is None or not ds_type:
+        id_from_qc, type_from_qc = _parse_chart_datasource_from_query_context(
+            enriched.get("query_context")
+        )
+        if ds_id is None:
+            ds_id = id_from_qc
+        if not ds_type:
+            ds_type = type_from_qc
+
+    if ds_name is None or ds_id is None or not ds_type:
+        try:
+            chart_id = _to_int(enriched.get("id"))
+            if chart_id is not None:
+                listing = next(
+                    (item for item in ws.charts() if _to_int(item.get("id")) == chart_id),
+                    None,
+                )
+                if isinstance(listing, dict):
+                    ds_id = ds_id or _to_int(listing.get("datasource_id"))
+                    ds_type = ds_type or listing.get("datasource_type")
+                    ds_name = ds_name or listing.get("datasource_name_text") or listing.get("datasource_name")
+        except Exception:
+            pass
+
+    if ds_name is None and ds_id is not None:
+        try:
+            dataset = ws.dataset_detail(ds_id)
+            ds_name = dataset.get("table_name") or dataset.get("datasource_name_text")
+        except Exception:
+            pass
+
+    if ds_id is not None:
+        enriched["datasource_id"] = ds_id
+    if ds_type:
+        enriched["datasource_type"] = ds_type
+    if ds_name:
+        enriched["datasource_name_text"] = ds_name
+    return enriched
+
+
+def _extract_position_chart_refs(position_json: Any) -> dict[str, int]:
+    """Return {layout_node_id: chart_id} from dashboard position_json."""
+    payload = _ensure_json_dict(position_json, "position_json")
+    refs: dict[str, int] = {}
+    for node_id, node in payload.items():
+        if not isinstance(node, dict):
+            continue
+        chart_id = _to_int(node.get("chartId"))
+        if chart_id is None:
+            meta = node.get("meta")
+            if isinstance(meta, dict):
+                chart_id = _to_int(meta.get("chartId"))
+        if chart_id is not None:
+            refs[str(node_id)] = chart_id
+    return refs
+
+
+def _extract_scope_chart_refs(json_metadata: Any) -> set[int]:
+    payload = _ensure_json_dict(json_metadata, "json_metadata")
+    charts_in_scope = payload.get("chartsInScope")
+    if not isinstance(charts_in_scope, dict):
+        return set()
+    refs: set[int] = set()
+    for raw_id in charts_in_scope.keys():
+        parsed = _to_int(raw_id)
+        if parsed is not None:
+            refs.add(parsed)
+    return refs
+
+
+def _dashboard_orphan_refs(
+    dashboard: dict[str, Any],
+    existing_chart_ids: set[int],
+) -> dict[str, Any]:
+    pos_refs = _extract_position_chart_refs(dashboard.get("position_json", {}))
+    position_ids = set(pos_refs.values())
+    scope_ids = _extract_scope_chart_refs(dashboard.get("json_metadata", {}))
+    referenced = position_ids | scope_ids
+    orphaned = sorted(chart_id for chart_id in referenced if chart_id not in existing_chart_ids)
+    return {
+        "position_chart_ids": sorted(position_ids),
+        "charts_in_scope_ids": sorted(scope_ids),
+        "orphaned_chart_refs": orphaned,
+        "orphaned_count": len(orphaned),
+    }
+
+
+def _chart_title(entry: dict[str, Any]) -> str | None:
+    for key in ("slice_name", "name", "chart_name"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _repair_dashboard_refs(
+    position_json: Any,
+    json_metadata: Any,
+    dashboard_charts: list[dict[str, Any]],
+    *,
+    strategy: Literal["replace_by_name", "remove_orphans"],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Repair stale chart refs in position_json and json_metadata."""
+    position = _ensure_json_dict(position_json, "position_json")
+    metadata = _ensure_json_dict(json_metadata, "json_metadata")
+
+    valid_chart_ids = {
+        cid for cid in (_to_int(chart.get("id")) for chart in dashboard_charts)
+        if cid is not None
+    }
+
+    charts_by_name: dict[str, int] = {}
+    for chart in dashboard_charts:
+        title = _chart_title(chart)
+        cid = _to_int(chart.get("id"))
+        if title and cid is not None:
+            charts_by_name.setdefault(title.lower(), cid)
+
+    position_refs = _extract_position_chart_refs(position)
+    replacement_map: dict[int, int] = {}
+    removed_nodes: set[str] = set()
+    stale_ids_before: set[int] = set()
+
+    for node_id, chart_id in position_refs.items():
+        if chart_id in valid_chart_ids:
+            continue
+        stale_ids_before.add(chart_id)
+        node = position.get(node_id, {})
+        replacement: int | None = None
+        if strategy == "replace_by_name" and isinstance(node, dict):
+            meta = node.get("meta", {})
+            title = None
+            if isinstance(meta, dict):
+                value = meta.get("sliceName") or meta.get("chartName") or meta.get("text")
+                if isinstance(value, str) and value.strip():
+                    title = value.strip().lower()
+            if title:
+                replacement = charts_by_name.get(title)
+        if replacement is not None:
+            if isinstance(node, dict):
+                if "chartId" in node:
+                    node["chartId"] = replacement
+                meta = node.get("meta")
+                if isinstance(meta, dict):
+                    meta["chartId"] = replacement
+            replacement_map[chart_id] = replacement
+            continue
+        removed_nodes.add(node_id)
+
+    for node_id in removed_nodes:
+        position.pop(node_id, None)
+
+    if removed_nodes:
+        for node in position.values():
+            if not isinstance(node, dict):
+                continue
+            children = node.get("children")
+            if isinstance(children, list):
+                node["children"] = [
+                    child for child in children if str(child) not in removed_nodes
+                ]
+
+    charts_in_scope = metadata.get("chartsInScope")
+    scope_before = set()
+    if isinstance(charts_in_scope, dict):
+        scope_before = _extract_scope_chart_refs(metadata)
+        updated_scope: dict[str, Any] = {}
+        for raw_id, value in charts_in_scope.items():
+            cid = _to_int(raw_id)
+            if cid is None:
+                continue
+            if cid in valid_chart_ids:
+                updated_scope[str(cid)] = value
+                continue
+            replacement = replacement_map.get(cid)
+            if replacement is not None:
+                updated_scope[str(replacement)] = value
+        metadata["chartsInScope"] = updated_scope
+
+    repaired_refs = _extract_position_chart_refs(position)
+    scope_after = _extract_scope_chart_refs(metadata)
+    stale_after = {
+        cid for cid in (set(repaired_refs.values()) | scope_after)
+        if cid not in valid_chart_ids
+    }
+
+    summary = {
+        "strategy": strategy,
+        "valid_chart_ids": sorted(valid_chart_ids),
+        "replacements": replacement_map,
+        "removed_layout_nodes": sorted(removed_nodes),
+        "orphaned_before": sorted(stale_ids_before | {cid for cid in scope_before if cid not in valid_chart_ids}),
+        "orphaned_after": sorted(stale_after),
+        "changed": bool(replacement_map or removed_nodes or stale_after != (stale_ids_before | {cid for cid in scope_before if cid not in valid_chart_ids})),
+    }
+
+    return position, metadata, summary
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +1046,10 @@ def use_workspace(workspace_title: str) -> str:
 
 @mcp.tool()
 @_handle_errors
-def list_dashboards(response_mode: ResponseMode = "standard") -> str:
+def list_dashboards(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+) -> str:
     """List dashboards in the current workspace.
 
     Start here to discover dashboard IDs, then use get_dashboard for
@@ -530,31 +1058,59 @@ def list_dashboards(response_mode: ResponseMode = "standard") -> str:
     Args:
         response_mode: 'compact' (id+title), 'standard' (key fields),
                        or 'full' (raw API response).  Default: standard.
+        name_contains: Case-insensitive substring filter on dashboard_title.
     """
     ws = _get_ws()
     raw = ws.dashboards()
+    if name_contains:
+        raw = _filter_by_name(raw, "dashboard", name_contains)
     _log.info("list_dashboards count=%d mode=%s", len(raw), response_mode)
     return _format_list(raw, "dashboard", response_mode)
 
 
 @mcp.tool()
 @_handle_errors
-def get_dashboard(dashboard_id: int) -> str:
-    """Get full detail for a single dashboard.
+def get_dashboard(
+    dashboard_id: int,
+    response_mode: ResponseMode = "full",
+) -> str:
+    """Get detail for a single dashboard.
 
-    Use list_dashboards first to find valid IDs.
+    Use list_dashboards first to find valid IDs.  Use response_mode to
+    control verbosity — dashboards can contain large position_json and
+    json_metadata blobs.
 
     Args:
         dashboard_id: Numeric dashboard ID
+        response_mode: 'compact' (id+title), 'standard' (key fields, no
+                       position_json), or 'full' (raw API response).
+                       Default: full.
     """
     ws = _get_ws()
-    return json.dumps(ws.dashboard_detail(dashboard_id), indent=2, default=str)
+    result = ws.dashboard_detail(dashboard_id)
+    try:
+        existing_chart_ids = {
+            cid for cid in (_to_int(ch.get("id")) for ch in ws.charts())
+            if cid is not None
+        }
+        health = _dashboard_orphan_refs(result, existing_chart_ids)
+        result["dashboard_health"] = health
+        result["orphaned_chart_refs"] = health["orphaned_chart_refs"]
+    except Exception as exc:
+        result["dashboard_health"] = {
+            "status": "unavailable",
+            "error": str(exc),
+        }
+    return _format_detail(result, "dashboard", response_mode)
 
 
 @mcp.tool()
 @_handle_errors
-def get_chart(chart_id: int) -> str:
-    """Get full detail for a single chart including params and query context.
+def get_chart(
+    chart_id: int,
+    response_mode: ResponseMode = "full",
+) -> str:
+    """Get detail for a single chart including params and query context.
 
     Returns the chart's visualization type, parameters, query_context,
     datasource info, and other metadata.  Use list_charts first to find
@@ -562,30 +1118,100 @@ def get_chart(chart_id: int) -> str:
 
     Args:
         chart_id: Numeric chart ID
+        response_mode: 'compact' (id+name+viz_type), 'standard' (key fields),
+                       or 'full' (raw API response).  Default: full.
     """
     ws = _get_ws()
-    return json.dumps(ws.chart_detail(chart_id), indent=2, default=str)
+    result = _enrich_chart_datasource_fields(ws, ws.chart_detail(chart_id))
+    return _format_detail(result, "chart", response_mode)
 
 
 @mcp.tool()
 @_handle_errors
-def list_charts(response_mode: ResponseMode = "standard") -> str:
+def get_dataset(
+    dataset_id: int,
+    response_mode: ResponseMode = "full",
+    refresh_columns: bool = False,
+) -> str:
+    """Get detail for a single dataset including columns, metrics, and SQL.
+
+    Use list_datasets first to find valid IDs.  Set refresh_columns=True
+    to query the source database for current column metadata (useful when
+    the underlying table schema has changed).
+
+    Args:
+        dataset_id: Numeric dataset ID
+        response_mode: 'compact' (id+name+schema), 'standard' (columns,
+                       metrics, sql), or 'full' (raw API response).
+                       Default: full.
+        refresh_columns: If True, also fetch live column metadata from the
+                         source database and include as 'external_columns'.
+    """
+    ws = _get_ws()
+    result = ws.dataset_detail(dataset_id)
+    if refresh_columns:
+        result["external_columns"] = ws.refresh_dataset_columns(dataset_id)
+    return _format_detail(result, "dataset", response_mode)
+
+
+@mcp.tool()
+@_handle_errors
+def get_database(
+    database_id: int,
+    response_mode: ResponseMode = "full",
+) -> str:
+    """Get detail for a single database connection.
+
+    Use list_databases first to find valid IDs.
+
+    Args:
+        database_id: Numeric database ID
+        response_mode: 'compact' (id+name+backend), 'standard' (key fields),
+                       or 'full' (raw API response).  Default: full.
+    """
+    ws = _get_ws()
+    result = ws.database_detail(database_id)
+    return _format_detail(result, "database", response_mode)
+
+
+@mcp.tool()
+@_handle_errors
+def list_charts(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+    viz_type: str | None = None,
+    dataset_id: int | None = None,
+) -> str:
     """List charts in the current workspace.
 
     Use this to find chart IDs and see which viz types are in use.
 
     Args:
         response_mode: 'compact', 'standard', or 'full'.  Default: standard.
+        name_contains: Case-insensitive substring filter on slice_name.
+        viz_type: Exact-match filter on viz_type (e.g. "echarts_timeseries_bar").
+        dataset_id: Filter to charts using this datasource_id.
     """
     ws = _get_ws()
     raw = ws.charts()
+    if name_contains:
+        raw = _filter_by_name(raw, "chart", name_contains)
+    if viz_type:
+        raw = [r for r in raw if r.get("viz_type") == viz_type]
+    if dataset_id is not None:
+        raw = [r for r in raw if r.get("datasource_id") == dataset_id]
     _log.info("list_charts count=%d mode=%s", len(raw), response_mode)
     return _format_list(raw, "chart", response_mode)
 
 
 @mcp.tool()
 @_handle_errors
-def list_datasets(response_mode: ResponseMode = "standard") -> str:
+def list_datasets(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+    schema: str | None = None,
+    database_id: int | None = None,
+) -> str:
     """List datasets (virtual tables) in the current workspace.
 
     Datasets are the data sources for charts.  Use list_databases to
@@ -593,16 +1219,29 @@ def list_datasets(response_mode: ResponseMode = "standard") -> str:
 
     Args:
         response_mode: 'compact', 'standard', or 'full'.  Default: standard.
+        name_contains: Case-insensitive substring filter on table_name.
+        schema: Server-side exact-match filter on schema name.
+        database_id: Server-side filter to datasets in this database.
     """
     ws = _get_ws()
-    raw = ws.datasets()
+    server_filters: dict = {}
+    if schema:
+        server_filters["schema"] = schema
+    if database_id is not None:
+        server_filters["database"] = OneToMany(database_id)
+    raw = ws.datasets(**server_filters)
+    if name_contains:
+        raw = _filter_by_name(raw, "dataset", name_contains)
     _log.info("list_datasets count=%d mode=%s", len(raw), response_mode)
     return _format_list(raw, "dataset", response_mode)
 
 
 @mcp.tool()
 @_handle_errors
-def list_databases(response_mode: ResponseMode = "standard") -> str:
+def list_databases(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+) -> str:
     """List database connections in the current workspace.
 
     Call this BEFORE run_sql or create_dataset to find a valid
@@ -610,9 +1249,12 @@ def list_databases(response_mode: ResponseMode = "standard") -> str:
 
     Args:
         response_mode: 'compact', 'standard', or 'full'.  Default: standard.
+        name_contains: Case-insensitive substring filter on database_name.
     """
     ws = _get_ws()
     raw = ws.databases()
+    if name_contains:
+        raw = _filter_by_name(raw, "database", name_contains)
     _log.info("list_databases count=%d mode=%s", len(raw), response_mode)
     return _format_list(raw, "database", response_mode)
 
@@ -740,6 +1382,88 @@ def run_sql(
         len(records) > SQL_SAMPLE_ROWS if response_mode == "standard" else "n/a",
     )
     return _format_sql(records, columns, response_mode)
+
+
+@mcp.tool()
+@_handle_errors
+def query_dataset(
+    dataset_id: int,
+    metrics: list[str] | str,
+    columns: list[str] | str | None = None,
+    time_column: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    granularity: str | None = None,
+    where: str = "",
+    having: str = "",
+    order_by: list[str] | str | None = None,
+    order_desc: bool = True,
+    row_limit: int = 10000,
+    force: bool = False,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Query a dataset using Superset's metric/dimension abstraction.
+
+    This executes the same query path that charts use — aggregating
+    metrics over dimension columns — without needing raw SQL.  Use
+    get_dataset to discover available metrics and columns first.
+
+    For time-series queries, set time_column plus start/end (ISO-8601)
+    and optionally granularity (e.g. "P1D", "P1W").
+
+    Args:
+        dataset_id: ID of the dataset to query
+        metrics: Metric names to aggregate (e.g. ["count", "revenue"])
+        columns: Dimension columns to group by
+        time_column: Time column for time-filtered or time-series queries
+        start: Start date/time in ISO-8601 format (e.g. "2025-01-01")
+        end: End date/time in ISO-8601 format (e.g. "2025-06-01")
+        granularity: Time grain (e.g. "P1D", "P1W", "P1M")
+        where: SQL WHERE clause fragment for filtering
+        having: SQL HAVING clause fragment for post-aggregation filtering
+        order_by: Columns or metrics to order by
+        order_desc: If True, sort descending (default: True)
+        row_limit: Max rows to return (default: 10000)
+        force: If True, bypass query cache
+        response_mode: 'compact' (columns only), 'standard' (sample rows),
+                       or 'full' (all rows).  Default: standard.
+    """
+    ws = _get_ws()
+    metrics_list = _coerce_list_arg(
+        metrics, field_name="metrics", item_kind="str"
+    )
+    if not metrics_list:
+        raise ValueError("metrics must contain at least one metric.")
+    columns_list = _coerce_list_arg(
+        columns, field_name="columns", item_kind="str"
+    )
+    order_by_list = _coerce_list_arg(
+        order_by, field_name="order_by", item_kind="str"
+    )
+    is_timeseries = bool(time_column and granularity)
+    df = ws.query_dataset(
+        dataset_id=dataset_id,
+        metrics=metrics_list,
+        columns=columns_list,
+        order_by=order_by_list,
+        order_desc=order_desc,
+        is_timeseries=is_timeseries,
+        time_column=time_column,
+        start=start,
+        end=end,
+        granularity=granularity,
+        where=where,
+        having=having,
+        row_limit=row_limit,
+        force=force,
+    )
+    records = df.to_dict("records")
+    col_names = df.columns.tolist()
+    _log.info(
+        "query_dataset dataset_id=%d rows=%d cols=%d mode=%s",
+        dataset_id, len(records), len(col_names), response_mode,
+    )
+    return _format_sql(records, col_names, response_mode)
 
 
 # ===================================================================
@@ -922,6 +1646,7 @@ def create_dataset(
     """
     _validate_readonly(sql)
     ws = _get_ws()
+    _require_database_exists(ws, database_id)
     return _do_mutation(
         tool_name="create_dataset",
         resource_type="dataset",
@@ -943,10 +1668,12 @@ def create_chart(
     dataset_id: int,
     title: str,
     viz_type: str,
-    metrics: list[str] | None = None,
-    groupby: list[str] | None = None,
+    metrics: list[str] | str | None = None,
+    groupby: list[str] | str | None = None,
     time_column: str | None = None,
-    dashboards: list[int] | None = None,
+    dashboards: list[int] | str | None = None,
+    validate_after_create: bool = True,
+    repair_dashboard_refs: bool = True,
     dry_run: bool = False,
 ) -> str:
     """Create a chart from an existing dataset.
@@ -964,21 +1691,43 @@ def create_chart(
         groupby: Columns to group by
         time_column: Time column for time-series charts
         dashboards: Dashboard IDs to attach this chart to
+        validate_after_create: Run chart-data validation after create
+        repair_dashboard_refs: Attempt to repair stale dashboard chart
+                               references when dashboards are provided
         dry_run: If True, validate inputs and return a preview without
                  making any changes (default: False)
     """
+    ws = _get_ws()
+    _require_dataset_exists(ws, dataset_id)
+    _validate_viz_type(ws, viz_type)
+
+    metrics_list = _coerce_list_arg(
+        metrics, field_name="metrics", item_kind="str"
+    )
+    groupby_list = _coerce_list_arg(
+        groupby, field_name="groupby", item_kind="str"
+    )
+    dashboards_list = _coerce_list_arg(
+        dashboards, field_name="dashboards", item_kind="int"
+    )
+    if dashboards_list:
+        _require_dashboards_exist(ws, dashboards_list)
+
     fields = ["dataset_id", "title", "viz_type"]
-    if metrics is not None:
+    if metrics_list is not None:
         fields.append("metrics")
-    if groupby is not None:
+    if groupby_list is not None:
         fields.append("groupby")
     if time_column is not None:
         fields.append("time_column")
-    if dashboards is not None:
+    if dashboards_list is not None:
         fields.append("dashboards")
+    if validate_after_create:
+        fields.append("validate_after_create")
+    if repair_dashboard_refs and dashboards_list:
+        fields.append("repair_dashboard_refs")
 
-    ws = _get_ws()
-    return _do_mutation(
+    raw = _do_mutation(
         tool_name="create_chart",
         resource_type="chart",
         action="create",
@@ -986,16 +1735,54 @@ def create_chart(
         dry_run=dry_run,
         execute=lambda: ws.create_chart(
             dataset_id, title, viz_type,
-            metrics=metrics, groupby=groupby,
-            time_column=time_column, dashboards=dashboards,
+            metrics=metrics_list, groupby=groupby_list,
+            time_column=time_column, dashboards=dashboards_list,
         ),
         preview_extras={"values": {
             "dataset_id": dataset_id, "title": title, "viz_type": viz_type,
-            "metrics": metrics, "groupby": groupby,
-            "time_column": time_column, "dashboards": dashboards,
+            "metrics": metrics_list, "groupby": groupby_list,
+            "time_column": time_column, "dashboards": dashboards_list,
+            "validate_after_create": validate_after_create,
+            "repair_dashboard_refs": repair_dashboard_refs,
         }},
         after_extras={"title": title},
     )
+    if dry_run:
+        return raw
+
+    payload = json.loads(raw)
+    chart_id = _to_int(payload.get("id"))
+    if chart_id is None:
+        return raw
+
+    if repair_dashboard_refs and dashboards_list:
+        repairs: list[dict[str, Any]] = []
+        for dashboard_id in dashboards_list:
+            dashboard = ws.dashboard_detail(dashboard_id)
+            charts = ws.dashboard_charts(dashboard_id)
+            position, metadata, summary = _repair_dashboard_refs(
+                dashboard.get("position_json", {}),
+                dashboard.get("json_metadata", {}),
+                charts,
+                strategy="replace_by_name",
+            )
+            if summary.get("changed"):
+                ws.update_dashboard(
+                    dashboard_id,
+                    position_json=json.dumps(position),
+                    json_metadata=json.dumps(metadata),
+                )
+            summary["dashboard_id"] = dashboard_id
+            repairs.append(summary)
+        payload["_dashboard_repairs"] = repairs
+
+    if validate_after_create:
+        dashboard_id = dashboards_list[0] if dashboards_list else None
+        payload["_validation"] = ws.validate_chart_data(
+            chart_id,
+            dashboard_id=dashboard_id,
+        )
+    return json.dumps(payload, indent=2, default=str)
 
 
 # ===================================================================
@@ -1045,6 +1832,7 @@ def update_dataset(
         )
 
     ws = _get_ws()
+    _require_dataset_exists(ws, dataset_id)
     before = capture_before(ws, "dataset", dataset_id)
 
     # Dependency check when SQL changes or columns are overridden
@@ -1090,7 +1878,8 @@ def update_chart(
     title: str | None = None,
     viz_type: str | None = None,
     params_json: str | None = None,
-    dashboards: list[int] | None = None,
+    dashboards: list[int] | str | None = None,
+    validate_after_update: bool = True,
     dry_run: bool = False,
 ) -> str:
     """Update an existing chart's title, viz type, or parameters.
@@ -1106,12 +1895,46 @@ def update_chart(
         params_json: JSON string of chart parameters (advanced — use
                      get_chart to inspect existing chart params first)
         dashboards: Reassign chart to these dashboard IDs
+        validate_after_update: Run chart-data validation after update
         dry_run: If True, validate inputs, capture current state, and
                  return a preview without making any changes
                  (default: False)
     """
+    ws = _get_ws()
+    _require_chart_exists(ws, chart_id)
+    before = capture_before(ws, "chart", chart_id)
+
+    chart_dataset_id = _to_int(before.get("datasource_id"))
+    if chart_dataset_id is None:
+        ds_from_params, _ = _parse_chart_datasource_from_params(before.get("params", {}))
+        chart_dataset_id = ds_from_params
+
+    dashboards_list = _coerce_list_arg(
+        dashboards, field_name="dashboards", item_kind="int"
+    )
+    if dashboards_list:
+        _require_dashboards_exist(ws, dashboards_list)
+
+    if viz_type is not None:
+        _validate_viz_type(ws, viz_type)
+
+    params_warnings: list[str] = []
     if params_json is not None:
-        validate_params_json(params_json)
+        dataset_columns: set[str] = set()
+        dataset_metrics: set[str] = set()
+        if chart_dataset_id is not None:
+            try:
+                dataset = ws.dataset_detail(chart_dataset_id)
+                dataset_columns = _dataset_columns(dataset)
+                dataset_metrics = _dataset_metrics(dataset)
+            except Exception:
+                dataset_columns = set()
+                dataset_metrics = set()
+        _, params_warnings = validate_params_payload(
+            params_json,
+            dataset_columns=dataset_columns,
+            dataset_metrics=dataset_metrics,
+        )
 
     kwargs: dict[str, Any] = {}
     if title is not None:
@@ -1120,19 +1943,15 @@ def update_chart(
         kwargs["viz_type"] = viz_type
     if params_json is not None:
         kwargs["params"] = params_json
-    if dashboards is not None:
-        kwargs["dashboards"] = dashboards
+    if dashboards_list is not None:
+        kwargs["dashboards"] = dashboards_list
 
     if not kwargs:
         raise ValueError(
             "Provide at least one field to update "
             "(title, viz_type, params_json, or dashboards)."
         )
-
-    ws = _get_ws()
-    before = capture_before(ws, "chart", chart_id)
-
-    return _do_mutation(
+    raw = _do_mutation(
         tool_name="update_chart",
         resource_type="chart",
         action="update",
@@ -1142,6 +1961,20 @@ def update_chart(
         resource_id=chart_id,
         before=before,
     )
+    if dry_run:
+        return raw
+
+    payload = json.loads(raw)
+    if params_warnings:
+        payload["_params_warnings"] = params_warnings
+
+    if validate_after_update:
+        dashboard_id = dashboards_list[0] if dashboards_list else None
+        payload["_validation"] = ws.validate_chart_data(
+            chart_id,
+            dashboard_id=dashboard_id,
+        )
+    return json.dumps(payload, indent=2, default=str)
 
 
 @mcp.tool()
@@ -1203,6 +2036,75 @@ def update_dashboard(
         execute=lambda: ws.update_dashboard(dashboard_id, **kwargs),
         resource_id=dashboard_id,
         before=before,
+    )
+
+
+# ===================================================================
+# Tools — Dashboard repair
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def repair_dashboard_chart_refs(
+    dashboard_id: int,
+    strategy: Literal["replace_by_name", "remove_orphans"] = "replace_by_name",
+    dry_run: bool = False,
+) -> str:
+    """Repair stale chart IDs in a dashboard's layout metadata.
+
+    This tool syncs `position_json` and `json_metadata.chartsInScope` by
+    replacing or removing orphaned chart references.
+
+    Args:
+        dashboard_id: Dashboard ID to repair
+        strategy: 'replace_by_name' (default) maps stale chart IDs to
+                  currently attached charts with matching names; or
+                  'remove_orphans' to drop stale references only.
+        dry_run: If True, preview detected changes without updating.
+    """
+    ws = _get_ws()
+    dashboard = ws.dashboard_detail(dashboard_id)
+    charts = ws.dashboard_charts(dashboard_id)
+    before = capture_before(ws, "dashboard", dashboard_id)
+
+    position, metadata, summary = _repair_dashboard_refs(
+        dashboard.get("position_json", {}),
+        dashboard.get("json_metadata", {}),
+        charts,
+        strategy=strategy,
+    )
+
+    if not summary.get("changed"):
+        payload = {
+            "status": "noop",
+            "dashboard_id": dashboard_id,
+            "repair_summary": summary,
+        }
+        if dry_run:
+            payload["dry_run"] = True
+        return json.dumps(payload, indent=2, default=str)
+
+    return _do_mutation(
+        tool_name="repair_dashboard_chart_refs",
+        resource_type="dashboard",
+        action="update",
+        fields_changed=["position_json", "json_metadata"],
+        dry_run=dry_run,
+        execute=lambda: ws.update_dashboard(
+            dashboard_id,
+            position_json=json.dumps(position),
+            json_metadata=json.dumps(metadata),
+        ),
+        resource_id=dashboard_id,
+        before=before,
+        preview_extras={
+            "repair_summary": summary,
+            "strategy": strategy,
+        },
+        result_extras={
+            "repair_summary": summary,
+        },
     )
 
 

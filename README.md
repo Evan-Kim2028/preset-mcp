@@ -42,7 +42,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 
 ```bash
 claude mcp list
-# Should show: preset-mcp  ... 16 tools
+# Should show: preset-mcp  ... 23 tools
 ```
 
 Then in a Claude Code session, try:
@@ -63,7 +63,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
   preset-mcp -- uv run --directory /path/to/preset-mcp preset-mcp
 ```
 
-## Tools (18)
+## Tools (23)
 
 ### Workspace Navigation
 
@@ -77,10 +77,13 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 | Tool | Purpose |
 |------|---------|
 | `list_dashboards` | List dashboards (with progressive disclosure) |
-| `get_dashboard` | Get full detail for a single dashboard |
+| `get_dashboard` | Get detail for a single dashboard (supports `response_mode`) |
 | `list_charts` | List charts |
+| `get_chart` | Get detail for a single chart (supports `response_mode`) |
 | `list_datasets` | List datasets |
+| `get_dataset` | Get detail for a single dataset (columns, metrics, SQL) |
 | `list_databases` | List database connections |
+| `get_database` | Get detail for a single database connection |
 | `workspace_catalog` | Relationship-aware topology map |
 
 ### Create
@@ -99,14 +102,21 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 | `update_chart` | Change a chart's title, viz type, or parameters |
 | `update_dashboard` | Rename or publish/unpublish a dashboard |
 
-### SQL & Audit
+### SQL & Query
 
 | Tool | Purpose |
 |------|---------|
-| `run_sql` | Execute a read-only query through Preset's connection |
-| `snapshot_workspace` | Full inventory dump for auditing |
+| `run_sql` | Execute a read-only SQL query through Preset's connection |
+| `query_dataset` | Query a dataset using Superset's metric/dimension abstraction |
+
+### Validation & Audit
+
+| Tool | Purpose |
+|------|---------|
 | `validate_chart` | Validate a single chart via chart-data execution |
 | `validate_dashboard` | Validate all charts on a dashboard |
+| `repair_dashboard_chart_refs` | Repair stale dashboard chart ID references |
+| `snapshot_workspace` | Full inventory dump for auditing |
 
 ## Typical Workflow
 
@@ -126,16 +136,21 @@ The intended workflow pairs preset-mcp with a data warehouse MCP (like [igloo-mc
 
 ### Progressive Disclosure
 
-All list tools accept a `response_mode` parameter to control token usage:
+All list and detail tools accept a `response_mode` parameter to control token usage:
 
 - **`compact`** — IDs and names only (~80% fewer tokens)
-- **`standard`** (default) — Key metadata fields
-- **`full`** — Raw API response
+- **`standard`** — Key metadata fields (default for list tools)
+- **`full`** — Raw API response (default for detail tools)
 
 ```
 list_dashboards(response_mode="compact")
 → {"count": 42, "data": [{"id": 1, "dashboard_title": "Revenue"}, ...]}
+
+get_dashboard(dashboard_id=80, response_mode="standard")
+→ key fields only, no position_json or json_metadata blobs
 ```
+
+Detail tools (`get_dashboard`, `get_chart`, `get_dataset`, `get_database`) default to `full` for backward compatibility. Use `standard` or `compact` to avoid large payloads — dashboards with 20+ charts can return 50-100K chars in full mode.
 
 ### SQL Safety
 
