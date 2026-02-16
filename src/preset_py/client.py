@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -383,6 +386,64 @@ def _datasource_from_form_data(form_data: dict[str, Any]) -> tuple[int, str]:
     return datasource_id, datasource_type or "table"
 
 
+def _parse_json_dict(value: Any) -> dict[str, Any] | None:
+    """Best-effort parse of a JSON object payload."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _datasource_from_chart_payloads(
+    chart: dict[str, Any],
+    form_data: dict[str, Any] | None = None,
+) -> tuple[int | None, str | None, str | None]:
+    """Resolve datasource from available chart payloads in priority order."""
+    candidates: list[tuple[dict[str, Any] | None, str]] = [
+        (form_data, "dashboard.form_data"),
+        (_parse_json_dict(chart.get("params")), "chart.params"),
+        (_parse_json_dict(chart.get("query_context")), "chart.query_context"),
+    ]
+    for payload, source in candidates:
+        if not isinstance(payload, dict):
+            continue
+        try:
+            datasource_id, datasource_type = _datasource_from_form_data(payload)
+            return datasource_id, datasource_type, source
+        except ValueError:
+            continue
+
+    datasource_id = _as_int(chart.get("datasource_id"))
+    datasource_type = chart.get("datasource_type")
+    if datasource_id is not None:
+        return datasource_id, str(datasource_type or "table"), "chart.detail"
+    return None, None, None
+
+
+def _critical_page_errors(page_errors: list[str]) -> list[str]:
+    """Filter browser page errors down to chart-impacting signals."""
+    ignored_page_error_substrings = (
+        "failed to fetch",
+        "uncaught (in promise) #<response>",
+        "unexpected token '<'",
+        "is not valid json",
+    )
+    critical: list[str] = []
+    for page_error in page_errors:
+        page_error_lower = page_error.lower()
+        if any(token in page_error_lower for token in ignored_page_error_substrings):
+            continue
+        critical.append(page_error)
+    return critical
+
+
 # ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
@@ -580,107 +641,138 @@ class PresetWorkspace:
         form_data, resolved_dashboard_id = self.chart_form_data(
             chart_id, dashboard_id=dashboard_id
         )
+        form_data_source = "dashboard.form_data"
         if not isinstance(form_data, dict):
-            return {
-                "chart_id": chart_id,
-                "slice_name": sheet_name,
-                "dashboard_id": dashboard_id,
-                "status": "unsupported",
-                "error": (
-                    "Could not locate chart form_data. "
-                    "Pass dashboard_id explicitly if the chart is part of a "
-                    "dashboard."
-                ),
-            }
+            form_data = _parse_json_dict(chart.get("params"))
+            form_data_source = "chart.params" if isinstance(form_data, dict) else "missing"
+        if not isinstance(form_data, dict):
+            form_data = {}
 
         if resolved_dashboard_id is not None:
             resolved_dashboard_id = int(resolved_dashboard_id)
         resolved_dashboard_id = resolved_dashboard_id or dashboard_id
 
-        try:
-            datasource_id, datasource_type = _datasource_from_form_data(form_data)
-        except ValueError as exc:
+        datasource_id, datasource_type, datasource_source = _datasource_from_chart_payloads(
+            chart,
+            form_data=form_data,
+        )
+        if datasource_id is None or datasource_type is None:
             return {
                 "chart_id": chart_id,
                 "slice_name": sheet_name,
                 "dashboard_id": resolved_dashboard_id,
                 "status": "invalid_form_data",
-                "error": str(exc),
+                "error": (
+                    "Could not resolve datasource from chart payloads "
+                    "(dashboard form_data, chart.params, chart.query_context)."
+                ),
                 "form_data": form_data,
+                "form_data_source": form_data_source,
             }
 
-        raw_metrics = _coerce_list(form_data.get("metrics"))
-        if not raw_metrics:
-            raw_metric = form_data.get("metric")
-            if raw_metric not in (None, "", []):
-                raw_metrics = _coerce_list(raw_metric)
-
-        dataset: dict[str, Any] = {}
-        try:
-            dataset = self._client.get_dataset(datasource_id)
-        except Exception:
-            dataset = {}
-
-        dataset_columns = _dataset_column_names(dataset)
-        dataset_metrics = _dataset_metric_names(dataset)
-        normalized_metrics = _normalize_metrics(
-            raw_metrics,
-            dataset_columns=dataset_columns,
-            dataset_metrics=dataset_metrics,
-        )
-
-        columns: list[Any] = []
-        columns.extend(_coerce_list(form_data.get("groupby")))
-        columns.extend(_coerce_list(form_data.get("columns")))
-        columns = list(dict.fromkeys(columns))
-
-        filters = _normalize_filters(form_data.get("filters"))
-        adhoc_filters = _normalize_filters(form_data.get("adhoc_filters"))
-
-        query: dict[str, Any] = {
-            "columns": columns,
-            "metrics": normalized_metrics,
-            "filters": filters,
-            "adhoc_filters": adhoc_filters,
-            "orderby": _normalize_orderby(
-                form_data.get("orderby"),
-                normalized_metrics,
-                dataset_columns,
-            ),
-            "is_timeseries": bool(
-                form_data.get("granularity_sqla")
-                or form_data.get("time_column")
-                or form_data.get("granularity")
-            ),
-            "extras": {
-                "where": "",
-                "having": "",
-            },
-            "annotation_layers": [],
-            "custom_form_data": {},
-            "custom_params": {},
-            "row_limit": row_limit,
-            "time_range": form_data.get("time_range", "No filter"),
-            "url_params": {},
-        }
-
-        if form_data.get("granularity_sqla"):
-            query["granularity_sqla"] = form_data["granularity_sqla"]
-        if form_data.get("time_column"):
-            query["granularity_sqla"] = form_data["time_column"]
-        if form_data.get("granularity"):
-            query.setdefault("extras", {})["time_grain_sqla"] = form_data["granularity"]
-
-        payload: dict[str, Any] = {
-            "datasource": {
+        query_context = _parse_json_dict(chart.get("query_context"))
+        payload_source = "synthetic.form_data"
+        if isinstance(query_context, dict) and isinstance(query_context.get("queries"), list):
+            payload = copy.deepcopy(query_context)
+            payload_source = "chart.query_context"
+            payload["datasource"] = {
                 "id": datasource_id,
                 "type": datasource_type,
-            },
-            "force": force,
-            "queries": [query],
-            "result_format": "json",
-            "result_type": "full",
-        }
+            }
+            payload["force"] = force
+            payload["result_format"] = "json"
+            payload["result_type"] = "full"
+            if isinstance(form_data, dict) and form_data:
+                payload.setdefault("form_data", form_data)
+            for query in payload.get("queries", []):
+                if isinstance(query, dict):
+                    query["row_limit"] = row_limit
+        else:
+            if not form_data:
+                return {
+                    "chart_id": chart_id,
+                    "slice_name": sheet_name,
+                    "dashboard_id": resolved_dashboard_id,
+                    "status": "unsupported",
+                    "error": (
+                        "Could not locate chart query_context or form_data. "
+                        "Pass dashboard_id explicitly if the chart is part of a "
+                        "dashboard."
+                    ),
+                }
+
+            raw_metrics = _coerce_list(form_data.get("metrics"))
+            if not raw_metrics:
+                raw_metric = form_data.get("metric")
+                if raw_metric not in (None, "", []):
+                    raw_metrics = _coerce_list(raw_metric)
+
+            dataset: dict[str, Any] = {}
+            try:
+                dataset = self._client.get_dataset(datasource_id)
+            except Exception:
+                dataset = {}
+
+            dataset_columns = _dataset_column_names(dataset)
+            dataset_metrics = _dataset_metric_names(dataset)
+            normalized_metrics = _normalize_metrics(
+                raw_metrics,
+                dataset_columns=dataset_columns,
+                dataset_metrics=dataset_metrics,
+            )
+
+            columns: list[Any] = []
+            columns.extend(_coerce_list(form_data.get("groupby")))
+            columns.extend(_coerce_list(form_data.get("columns")))
+            columns = list(dict.fromkeys(columns))
+
+            filters = _normalize_filters(form_data.get("filters"))
+            adhoc_filters = _normalize_filters(form_data.get("adhoc_filters"))
+
+            query: dict[str, Any] = {
+                "columns": columns,
+                "metrics": normalized_metrics,
+                "filters": filters,
+                "adhoc_filters": adhoc_filters,
+                "orderby": _normalize_orderby(
+                    form_data.get("orderby"),
+                    normalized_metrics,
+                    dataset_columns,
+                ),
+                "is_timeseries": bool(
+                    form_data.get("granularity_sqla")
+                    or form_data.get("time_column")
+                    or form_data.get("granularity")
+                ),
+                "extras": {
+                    "where": "",
+                    "having": "",
+                },
+                "annotation_layers": [],
+                "custom_form_data": {},
+                "custom_params": {},
+                "row_limit": row_limit,
+                "time_range": form_data.get("time_range", "No filter"),
+                "url_params": {},
+            }
+
+            if form_data.get("granularity_sqla"):
+                query["granularity_sqla"] = form_data["granularity_sqla"]
+            if form_data.get("time_column"):
+                query["granularity_sqla"] = form_data["time_column"]
+            if form_data.get("granularity"):
+                query.setdefault("extras", {})["time_grain_sqla"] = form_data["granularity"]
+
+            payload: dict[str, Any] = {
+                "datasource": {
+                    "id": datasource_id,
+                    "type": datasource_type,
+                },
+                "force": force,
+                "queries": [query],
+                "result_format": "json",
+                "result_type": "full",
+            }
 
         endpoint = str(self._client.baseurl / "api/v1" / "chart" / "data")
         response = self._client.session.post(endpoint, json=payload)
@@ -707,6 +799,7 @@ class PresetWorkspace:
                 "error": body.get("message", body),
                 "http_status": response.status_code,
                 "payload": payload,
+                "payload_source": payload_source,
             }
 
         results = body.get("result", [])
@@ -718,9 +811,43 @@ class PresetWorkspace:
                 "status": "malformed_response",
                 "error": "Unexpected chart-data response shape",
                 "payload": payload,
+                "payload_source": payload_source,
             }
 
         first = results[0]
+        query_results: list[dict[str, Any]] = []
+        overall_status = "success"
+        first_error: Any = None
+        total_rows = 0
+        for idx, item in enumerate(results):
+            if not isinstance(item, dict):
+                overall_status = "failed"
+                malformed_error = f"query[{idx}] has malformed response entry."
+                if first_error is None:
+                    first_error = malformed_error
+                query_results.append({
+                    "index": idx,
+                    "status": "malformed",
+                    "error": malformed_error,
+                    "row_count": None,
+                })
+                continue
+            status = item.get("status")
+            error = item.get("error")
+            row_count = item.get("rowcount")
+            if isinstance(row_count, int):
+                total_rows += row_count
+            query_results.append({
+                "index": idx,
+                "status": status,
+                "error": error,
+                "row_count": row_count,
+            })
+            if status != "success" or error:
+                overall_status = "failed"
+                if first_error is None:
+                    first_error = error or f"query[{idx}] returned status {status!r}"
+
         return {
             "chart_id": chart_id,
             "slice_name": sheet_name,
@@ -729,15 +856,21 @@ class PresetWorkspace:
                 "id": datasource_id,
                 "type": datasource_type,
             },
-            "status": first.get("status"),
-            "error": first.get("error"),
+            "status": overall_status if query_results else first.get("status"),
+            "error": first_error,
             "row_count": first.get("rowcount"),
+            "row_count_total": total_rows,
             "cache_key": first.get("cache_key"),
             "is_cached": first.get("is_cached"),
             "query": first.get("query"),
             "result_format": first.get("result_format"),
             "form_data": form_data,
+            "form_data_source": form_data_source,
             "payload": payload,
+            "payload_source": payload_source,
+            "query_results": query_results,
+            "query_context_present": bool(query_context),
+            "datasource_source": datasource_source,
         }
 
     def validate_dashboard_charts(
@@ -759,6 +892,233 @@ class PresetWorkspace:
             "dashboard_id": dashboard_id,
             "chart_count": len(charts),
             "validated": len(results),
+            "results": results,
+        }
+
+    def validate_chart_render(
+        self,
+        chart_id: int,
+        *,
+        timeout_ms: int = 45000,
+        settle_ms: int = 2500,
+        screenshot_on_failure: bool = True,
+    ) -> dict[str, Any]:
+        """Validate chart rendering in a headless browser session.
+
+        This is stricter than query-only validation because it observes browser
+        runtime failures (console/page errors and failed chart-data requests).
+        """
+        chart = self.get_resource("chart", chart_id)
+        sheet_name = chart.get("slice_name") or chart.get("name") or f"chart-{chart_id}"
+
+        auth_header = self._client.session.headers.get("Authorization")
+        if not isinstance(auth_header, str) or not auth_header:
+            return {
+                "chart_id": chart_id,
+                "slice_name": sheet_name,
+                "status": "unsupported",
+                "error": "Missing Authorization header for browser render validation.",
+            }
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            return {
+                "chart_id": chart_id,
+                "slice_name": sheet_name,
+                "status": "unsupported",
+                "error": (
+                    "Playwright is not installed. Install it with "
+                    "`pip install playwright` and run `playwright install chromium`."
+                ),
+                "exception": str(exc),
+            }
+
+        explore_url = str(
+            self._client.baseurl.with_path("/explore/").with_query({"slice_id": chart_id})
+        )
+        workspace_origin = str(self._client.baseurl.origin())
+
+        console_errors: list[str] = []
+        page_errors: list[str] = []
+        critical_page_errors: list[str] = []
+        request_failures: list[dict[str, Any]] = []
+        chart_data_failures: list[dict[str, Any]] = []
+        visible_errors: list[str] = []
+        screenshot_path: str | None = None
+        navigation_error: str | None = None
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+
+            def _on_console(msg):
+                if msg.type == "error":
+                    console_errors.append(msg.text)
+
+            def _on_pageerror(exc):
+                page_errors.append(str(exc))
+
+            def _on_requestfailed(request):
+                failure = request.failure
+                if isinstance(failure, dict):
+                    error_text = failure.get("errorText")
+                elif isinstance(failure, str):
+                    error_text = failure
+                else:
+                    error_text = getattr(failure, "error_text", None)
+                request_failures.append(
+                    {
+                        "url": request.url,
+                        "method": request.method,
+                        "error_text": error_text,
+                    }
+                )
+                if "/api/v1/chart/data" in request.url:
+                    chart_data_failures.append(
+                        {
+                            "url": request.url,
+                            "status": None,
+                            "error_text": error_text,
+                        }
+                    )
+
+            def _on_response(response):
+                if "/api/v1/chart/data" not in response.url:
+                    return
+                if response.status < 400:
+                    return
+                body_preview = ""
+                try:
+                    body_preview = response.text()[:400]
+                except Exception:
+                    body_preview = ""
+                chart_data_failures.append(
+                    {
+                        "url": response.url,
+                        "status": response.status,
+                        "body_preview": body_preview,
+                    }
+                )
+
+            page.on("console", _on_console)
+            page.on("pageerror", _on_pageerror)
+            page.on("requestfailed", _on_requestfailed)
+            page.on("response", _on_response)
+            # Add bearer auth only for workspace-origin requests. Injecting it
+            # cross-origin triggers CORS preflights that produce false failures.
+            page.route(
+                "**/*",
+                lambda route, request: route.continue_(
+                    headers={
+                        **request.headers,
+                        "Authorization": auth_header,
+                    }
+                )
+                if request.url.startswith(workspace_origin)
+                else route.continue_(),
+            )
+
+            try:
+                page.goto(explore_url, wait_until="networkidle", timeout=timeout_ms)
+                if settle_ms > 0:
+                    page.wait_for_timeout(settle_ms)
+            except Exception as exc:
+                navigation_error = str(exc)
+            critical_page_errors.extend(_critical_page_errors(page_errors))
+
+            error_selectors = [
+                ".alert-danger",
+                ".ant-alert-error",
+                ".Toastify__toast--error",
+                "text=Unexpected error",
+                "text=GENERIC_BACKEND_ERROR",
+                "text=Issue 1011",
+            ]
+            for selector in error_selectors:
+                locator = page.locator(selector)
+                try:
+                    count = locator.count()
+                except Exception:
+                    continue
+                for idx in range(min(count, 3)):
+                    item = locator.nth(idx)
+                    try:
+                        if not item.is_visible():
+                            continue
+                        text = item.inner_text(timeout=500).strip()
+                        if text:
+                            visible_errors.append(text[:400])
+                    except Exception:
+                        continue
+
+            if screenshot_on_failure:
+                has_failures = bool(
+                    navigation_error
+                    or critical_page_errors
+                    or chart_data_failures
+                    or visible_errors
+                )
+                if has_failures:
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    path = Path("/tmp") / f"preset_chart_render_{chart_id}_{ts}.png"
+                    try:
+                        page.screenshot(path=str(path), full_page=True)
+                        screenshot_path = str(path)
+                    except Exception:
+                        screenshot_path = None
+
+            browser.close()
+
+        status = "success"
+        if navigation_error or critical_page_errors or chart_data_failures or visible_errors:
+            status = "failed"
+
+        return {
+            "chart_id": chart_id,
+            "slice_name": sheet_name,
+            "url": explore_url,
+            "status": status,
+            "error": navigation_error,
+            "console_errors": console_errors,
+            "page_errors": page_errors,
+            "critical_page_errors": critical_page_errors,
+            "request_failures": request_failures,
+            "chart_data_failures": chart_data_failures,
+            "visible_errors": visible_errors,
+            "screenshot_path": screenshot_path,
+        }
+
+    def validate_dashboard_render(
+        self,
+        dashboard_id: int,
+        *,
+        timeout_ms: int = 45000,
+        settle_ms: int = 2500,
+    ) -> dict[str, Any]:
+        """Run render validation on each chart referenced by a dashboard."""
+        charts = self.dashboard_charts(dashboard_id)
+        results: list[dict[str, Any]] = []
+        for chart in charts:
+            cid = chart.get("id")
+            if not isinstance(cid, int):
+                continue
+            results.append(
+                self.validate_chart_render(
+                    cid,
+                    timeout_ms=timeout_ms,
+                    settle_ms=settle_ms,
+                )
+            )
+
+        broken = [item for item in results if item.get("status") != "success"]
+        return {
+            "dashboard_id": dashboard_id,
+            "chart_count": len(charts),
+            "validated": len(results),
+            "broken_count": len(broken),
+            "broken_charts": broken,
             "results": results,
         }
 

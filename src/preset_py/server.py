@@ -625,6 +625,10 @@ def _dashboard_orphan_refs(
     }
 
 
+def _layout_chart_ids(position_json: Any) -> set[int]:
+    return set(_extract_position_chart_refs(position_json).values())
+
+
 def _chart_title(entry: dict[str, Any]) -> str | None:
     for key in ("slice_name", "name", "chart_name"):
         value = entry.get(key)
@@ -1524,9 +1528,13 @@ def validate_chart(
             "status": result.get("status"),
             "error": result.get("error"),
             "row_count": result.get("row_count"),
+            "row_count_total": result.get("row_count_total"),
             "cache_key": result.get("cache_key"),
             "is_cached": result.get("is_cached"),
             "http_status": result.get("http_status"),
+            "payload_source": result.get("payload_source"),
+            "form_data_source": result.get("form_data_source"),
+            "query_context_present": result.get("query_context_present"),
         }, indent=2, default=str)
     return json.dumps(result, indent=2, default=str)
 
@@ -1579,6 +1587,92 @@ def validate_dashboard(
             ],
         }
         return json.dumps(summary, indent=2, default=str)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def validate_chart_render(
+    chart_id: int,
+    timeout_ms: int = 45000,
+    settle_ms: int = 2500,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Validate chart rendering with a headless browser (frontend-level probe)."""
+    ws = _get_ws()
+    result = ws.validate_chart_render(
+        chart_id,
+        timeout_ms=timeout_ms,
+        settle_ms=settle_ms,
+    )
+    if response_mode == "compact":
+        return json.dumps({
+            "chart_id": result.get("chart_id"),
+            "slice_name": result.get("slice_name"),
+            "status": result.get("status"),
+            "error": result.get("error"),
+            "screenshot_path": result.get("screenshot_path"),
+        }, indent=2, default=str)
+    if response_mode == "standard":
+        return json.dumps({
+            "chart_id": result.get("chart_id"),
+            "slice_name": result.get("slice_name"),
+            "status": result.get("status"),
+            "error": result.get("error"),
+            "visible_errors": result.get("visible_errors"),
+            "critical_page_errors": result.get("critical_page_errors"),
+            "page_errors": result.get("page_errors"),
+            "chart_data_failures": result.get("chart_data_failures"),
+            "screenshot_path": result.get("screenshot_path"),
+        }, indent=2, default=str)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def validate_dashboard_render(
+    dashboard_id: int,
+    timeout_ms: int = 45000,
+    settle_ms: int = 2500,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Validate frontend render status for all charts on a dashboard."""
+    ws = _get_ws()
+    result = ws.validate_dashboard_render(
+        dashboard_id,
+        timeout_ms=timeout_ms,
+        settle_ms=settle_ms,
+    )
+    if response_mode == "compact":
+        return json.dumps({
+            "dashboard_id": result.get("dashboard_id"),
+            "chart_count": result.get("chart_count"),
+            "validated": result.get("validated"),
+            "broken_count": result.get("broken_count"),
+        }, indent=2, default=str)
+    if response_mode == "standard":
+        broken_summaries: list[dict[str, Any]] = []
+        for item in result.get("broken_charts", []):
+            if not isinstance(item, dict):
+                continue
+            broken_summaries.append({
+                "chart_id": item.get("chart_id"),
+                "slice_name": item.get("slice_name"),
+                "status": item.get("status"),
+                "error": item.get("error"),
+                "visible_errors": item.get("visible_errors"),
+                "critical_page_errors": item.get("critical_page_errors"),
+                "page_errors": item.get("page_errors"),
+                "chart_data_failures": item.get("chart_data_failures"),
+                "screenshot_path": item.get("screenshot_path"),
+            })
+        return json.dumps({
+            "dashboard_id": result.get("dashboard_id"),
+            "chart_count": result.get("chart_count"),
+            "validated": result.get("validated"),
+            "broken_count": result.get("broken_count"),
+            "broken_charts": broken_summaries,
+        }, indent=2, default=str)
     return json.dumps(result, indent=2, default=str)
 
 
@@ -1985,6 +2079,7 @@ def update_dashboard(
     published: bool | None = None,
     position_json: str | None = None,
     json_metadata: str | None = None,
+    allow_empty_layout: bool = False,
     dry_run: bool = False,
 ) -> str:
     """Update an existing dashboard's properties.
@@ -2004,6 +2099,8 @@ def update_dashboard(
             config, color schemes, label colors, refresh settings).
             Update this alongside position_json to keep chart references
             in sync.
+        allow_empty_layout: If True, allow updates that remove all chart
+            containers from the layout tree (default: False).
         dry_run: If True, validate inputs, capture current state, and
                  return a preview without making any changes
                  (default: False)
@@ -2026,6 +2123,30 @@ def update_dashboard(
 
     ws = _get_ws()
     before = capture_before(ws, "dashboard", dashboard_id)
+
+    if position_json is not None:
+        proposed_position = _ensure_json_dict(position_json, "position_json")
+        proposed_chart_ids = _layout_chart_ids(proposed_position)
+
+        existing_layout_ids = _layout_chart_ids(before.get("position_json", {}))
+        attached_chart_ids: set[int] = set()
+        if not existing_layout_ids:
+            try:
+                for chart in ws.dashboard_charts(dashboard_id):
+                    chart_id = _to_int(chart.get("id"))
+                    if chart_id is not None:
+                        attached_chart_ids.add(chart_id)
+            except Exception:
+                attached_chart_ids = set()
+
+        dashboard_has_charts = bool(existing_layout_ids or attached_chart_ids)
+        if dashboard_has_charts and not proposed_chart_ids and not allow_empty_layout:
+            raise ValueError(
+                "Blocked potentially destructive layout update: position_json "
+                "removes all chart containers from a dashboard that currently "
+                "has charts. If this is intentional, re-run with "
+                "allow_empty_layout=True."
+            )
 
     return _do_mutation(
         tool_name="update_dashboard",

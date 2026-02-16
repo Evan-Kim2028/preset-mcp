@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.2 - 2026-02-16
+
+### Fixed
+- `validate_chart` now prefers saved `query_context` and falls back to
+  `chart.params` when dashboard `form_data` is unavailable.
+- Validation now aggregates all query results from `/api/v1/chart/data`
+  instead of trusting only the first query result.
+- Added richer validation diagnostics: `payload_source`,
+  `form_data_source`, `query_context_present`, `row_count_total`, and
+  per-query statuses.
+- Added frontend render validation tools:
+  - `validate_chart_render`
+  - `validate_dashboard_render`
+- Fixed render-validation false failures by injecting `Authorization`
+  only for workspace-origin browser requests.
+- Added page-error filtering so known non-chart browser noise does not
+  mark a chart as broken.
+
+### Quality
+- Added client-side tests for:
+  - query-context-first validation path
+  - chart.params fallback path
+  - unsupported path when both query context and form data are missing
+  - render page-error classification filtering
+- Added server-tool tests for new render validation MCP tools.
+
+### Docs
+- Added execution plan for the 0.5.1 release scope in
+  `docs/release-0.5.1-execution-plan.md`.
+
 ## 0.5.0 - 2026-02-16
 
 ### Fixed

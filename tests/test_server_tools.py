@@ -146,3 +146,117 @@ def test_repair_dashboard_refs_replaces_orphans_by_name() -> None:
 def test_coerce_list_arg_handles_json_arrays() -> None:
     assert server._coerce_list_arg('["a","b"]', field_name="metrics", item_kind="str") == ["a", "b"]
     assert server._coerce_list_arg("[1,2,3]", field_name="dashboards", item_kind="int") == [1, 2, 3]
+
+
+def test_validate_chart_render_tool_passes_through(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def validate_chart_render(self, chart_id: int, **kwargs):
+            return {
+                "chart_id": chart_id,
+                "slice_name": "Render Check",
+                "status": "success",
+                "error": None,
+                "screenshot_path": None,
+                "kwargs": kwargs,
+            }
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.validate_chart_render.fn(
+        chart_id=10,
+        timeout_ms=12345,
+        settle_ms=777,
+        response_mode="standard",
+    )
+    payload = json.loads(raw)
+    assert payload["chart_id"] == 10
+    assert payload["status"] == "success"
+
+
+def test_validate_dashboard_render_tool_compact(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def validate_dashboard_render(self, dashboard_id: int, **kwargs):
+            return {
+                "dashboard_id": dashboard_id,
+                "chart_count": 2,
+                "validated": 2,
+                "broken_count": 1,
+                "broken_charts": [
+                    {"chart_id": 99, "status": "failed"},
+                ],
+                "kwargs": kwargs,
+            }
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.validate_dashboard_render.fn(
+        dashboard_id=77,
+        response_mode="compact",
+    )
+    payload = json.loads(raw)
+    assert payload["dashboard_id"] == 77
+    assert payload["broken_count"] == 1
+
+
+def test_update_dashboard_blocks_empty_layout_wipe(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "position_json": {
+                    "ROOT_ID": {"children": ["GRID_ID"]},
+                    "GRID_ID": {"children": ["CHART-1"]},
+                    "CHART-1": {"meta": {"chartId": 101}},
+                },
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return [{"id": 101}]
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            raise AssertionError("update_dashboard should have been blocked")
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError) as exc:
+        server.update_dashboard.fn(
+            dashboard_id=80,
+            position_json='{"DASHBOARD_VERSION_KEY":"v2","ROOT_ID":{"children":["GRID_ID"]},"GRID_ID":{"children":[]}}',
+        )
+    payload = _validation_payload(exc.value)
+    assert payload["error_type"] == "validation"
+    assert "Blocked potentially destructive layout update" in payload["error"]
+
+
+def test_update_dashboard_allows_empty_layout_with_override(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def __init__(self) -> None:
+            self.updated = False
+
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "position_json": {
+                    "ROOT_ID": {"children": ["GRID_ID"]},
+                    "GRID_ID": {"children": ["CHART-1"]},
+                    "CHART-1": {"meta": {"chartId": 101}},
+                },
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return [{"id": 101}]
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            self.updated = True
+            return {"id": dashboard_id, **kwargs}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.update_dashboard.fn(
+        dashboard_id=80,
+        position_json='{"DASHBOARD_VERSION_KEY":"v2","ROOT_ID":{"children":["GRID_ID"]},"GRID_ID":{"children":[]}}',
+        allow_empty_layout=True,
+    )
+    payload = json.loads(raw)
+    assert ws.updated is True
+    assert payload["id"] == 80
