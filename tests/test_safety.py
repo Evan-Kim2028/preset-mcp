@@ -49,3 +49,39 @@ def test_params_payload_rejects_metric_dimension_label_collision() -> None:
             dataset_columns={"CHAIN"},
             dataset_metrics={"count"},
         )
+
+
+def test_params_payload_enforces_pie_required_fields() -> None:
+    with pytest.raises(ValueError, match="Pie charts require params_json.metrics"):
+        validate_params_payload(
+            '{"groupby":["CHAIN"]}',
+            dataset_columns={"CHAIN"},
+            dataset_metrics={"count"},
+            viz_type="pie",
+        )
+
+    with pytest.raises(ValueError, match="Pie charts require params_json.groupby"):
+        validate_params_payload(
+            '{"metrics":["count"]}',
+            dataset_columns={"CHAIN"},
+            dataset_metrics={"count"},
+            viz_type="pie",
+        )
+
+
+def test_params_payload_enforces_timeseries_required_fields() -> None:
+    with pytest.raises(ValueError, match="requires params_json.metrics"):
+        validate_params_payload(
+            '{"granularity_sqla":"DAY"}',
+            dataset_columns={"DAY"},
+            dataset_metrics={"count"},
+            viz_type="echarts_timeseries_line",
+        )
+
+    with pytest.raises(ValueError, match="requires a time column"):
+        validate_params_payload(
+            '{"metrics":["count"]}',
+            dataset_columns={"DAY"},
+            dataset_metrics={"count"},
+            viz_type="echarts_timeseries_line",
+        )

@@ -42,7 +42,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 
 ```bash
 claude mcp list
-# Should show: preset-mcp  ... 28 tools
+# Should show: preset-mcp  ... 29 tools
 ```
 
 Then in a Claude Code session, try:
@@ -63,7 +63,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
   preset-mcp -- uv run --directory /path/to/preset-mcp preset-mcp
 ```
 
-## Tools (28)
+## Tools (29)
 
 ### Workspace Navigation
 
@@ -117,6 +117,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 | `validate_dashboard` | Validate all charts on a dashboard |
 | `validate_chart_render` | Validate chart rendering via headless browser probe |
 | `validate_dashboard_render` | Validate render status across dashboard charts |
+| `verify_chart_workflow` | One-shot chart→dashboard query/render verification |
 | `repair_dashboard_chart_refs` | Repair stale dashboard chart ID references |
 | `list_mutations` | Inspect local mutation audit journal entries |
 | `list_dashboard_snapshots` | List local pre-mutation dashboard snapshots |
@@ -236,6 +237,7 @@ Use `params_json` for advanced chart params such as ad-hoc filters.
 
 Notes:
 - `create_chart.metrics` accepts saved metric names or ad-hoc metric objects.
+- `create_chart.template="auto"` applies viz-specific defaults for missing fields.
 - `params_json` is validated preflight against dataset columns/metrics.
 - `params_json` cannot include datasource-rebinding keys like `viz_type` or `datasource_id`.
 

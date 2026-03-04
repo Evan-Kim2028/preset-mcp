@@ -24,6 +24,16 @@
   - `list_mutations`
   - `list_dashboard_snapshots`
   - `restore_dashboard_snapshot`
+- `verify_chart_workflow` tool for one-shot end-to-end chart/dashboard
+  verification (query + optional render checks).
+
+### Improved
+- `create_chart` now supports `template` mode (`auto` or `minimal`).
+  `auto` fills missing, viz-specific defaults to improve first-pass
+  chart renderability.
+- Viz-aware params validation now enforces required fields for common chart
+  types (`pie`, timeseries ECharts, `big_number_total`), reducing incomplete
+  chart configs that pass mutation but fail at render time.
 
 ### Quality
 - Added regression tests covering:

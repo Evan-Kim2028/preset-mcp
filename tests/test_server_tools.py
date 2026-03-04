@@ -129,6 +129,25 @@ def test_create_chart_accepts_adhoc_metric_and_params_json(monkeypatch) -> None:
     assert ws.create_kwargs is not None
     assert ws.create_kwargs["metrics"][0]["expressionType"] == "SQL"
     assert ws.create_kwargs["adhoc_filters"][0]["col"] == "TOKEN_SYMBOL"
+    assert ws.create_kwargs["template"] == "auto"
+
+
+def test_create_chart_rejects_invalid_template(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def dataset_detail(self, dataset_id: int):
+            return {"id": dataset_id, "columns": [], "metrics": []}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    with pytest.raises(ToolError) as exc:
+        server.create_chart.fn(
+            dataset_id=10,
+            title="Bad Template",
+            viz_type="table",
+            template="foobar",
+            dry_run=True,
+        )
+    payload = _validation_payload(exc.value)
+    assert "template must be one of" in payload["error"]
 
 
 def test_create_chart_rejects_duplicate_metrics_inputs(monkeypatch) -> None:
@@ -466,3 +485,35 @@ def test_list_dashboard_snapshots_filters_by_dashboard(monkeypatch, tmp_path) ->
     payload = json.loads(raw)
     assert payload["count"] == 1
     assert payload["snapshots"][0]["dashboard_id"] == 80
+
+
+def test_verify_chart_workflow_compact(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def validate_chart_data(self, chart_id: int, dashboard_id=None, row_limit=10000, force=False):
+            return {"status": "success", "chart_id": chart_id}
+
+        def validate_chart_render(self, chart_id: int, **kwargs):
+            return {"status": "success", "chart_id": chart_id}
+
+        def validate_dashboard_charts(self, dashboard_id: int, row_limit=10000, force=False):
+            return {
+                "dashboard_id": dashboard_id,
+                "results": [{"status": "success"}],
+                "chart_count": 1,
+                "validated": 1,
+            }
+
+        def validate_dashboard_render(self, dashboard_id: int, **kwargs):
+            return {"dashboard_id": dashboard_id, "broken_count": 0, "chart_count": 1}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    raw = server.verify_chart_workflow.fn(
+        chart_id=10,
+        dashboard_id=80,
+        include_render=True,
+        response_mode="compact",
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "success"
+    assert payload["dashboard_render_broken_count"] == 0

@@ -1734,6 +1734,142 @@ def validate_dashboard_render(
     return json.dumps(result, indent=2, default=str)
 
 
+@mcp.tool()
+@_handle_errors
+def verify_chart_workflow(
+    chart_id: int,
+    dashboard_id: int | None = None,
+    include_render: bool = True,
+    row_limit: int = 10000,
+    force: bool = False,
+    timeout_ms: int = 45000,
+    settle_ms: int = 2500,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Run end-to-end checks for chart query/render and optional dashboard context."""
+    ws = _get_ws()
+    chart_query = ws.validate_chart_data(
+        chart_id,
+        dashboard_id=dashboard_id,
+        row_limit=row_limit,
+        force=force,
+    )
+    chart_render = (
+        ws.validate_chart_render(
+            chart_id,
+            timeout_ms=timeout_ms,
+            settle_ms=settle_ms,
+        )
+        if include_render
+        else None
+    )
+
+    dashboard_query = None
+    dashboard_render = None
+    if dashboard_id is not None:
+        dashboard_query = ws.validate_dashboard_charts(
+            dashboard_id,
+            row_limit=row_limit,
+            force=force,
+        )
+        if include_render:
+            dashboard_render = ws.validate_dashboard_render(
+                dashboard_id,
+                timeout_ms=timeout_ms,
+                settle_ms=settle_ms,
+            )
+
+    status = "success"
+    if chart_query.get("status") != "success":
+        status = "failed"
+    if include_render and chart_render and chart_render.get("status") != "success":
+        status = "failed"
+    if isinstance(dashboard_query, dict):
+        dq_results = dashboard_query.get("results", [])
+        if any(
+            isinstance(item, dict) and item.get("status") != "success"
+            for item in dq_results
+        ):
+            status = "failed"
+    if include_render and isinstance(dashboard_render, dict):
+        if int(dashboard_render.get("broken_count") or 0) > 0:
+            status = "failed"
+
+    result = {
+        "status": status,
+        "chart_id": chart_id,
+        "dashboard_id": dashboard_id,
+        "include_render": include_render,
+        "chart_query": chart_query,
+        "chart_render": chart_render,
+        "dashboard_query": dashboard_query,
+        "dashboard_render": dashboard_render,
+    }
+
+    if response_mode == "compact":
+        return json.dumps({
+            "status": status,
+            "chart_id": chart_id,
+            "dashboard_id": dashboard_id,
+            "chart_query_status": chart_query.get("status"),
+            "chart_render_status": chart_render.get("status") if isinstance(chart_render, dict) else None,
+            "dashboard_query_failures": (
+                len([
+                    item for item in (dashboard_query or {}).get("results", [])
+                    if isinstance(item, dict) and item.get("status") != "success"
+                ])
+                if isinstance(dashboard_query, dict) else None
+            ),
+            "dashboard_render_broken_count": (
+                int((dashboard_render or {}).get("broken_count") or 0)
+                if isinstance(dashboard_render, dict) else None
+            ),
+        }, indent=2, default=str)
+
+    if response_mode == "standard":
+        return json.dumps({
+            "status": status,
+            "chart_id": chart_id,
+            "dashboard_id": dashboard_id,
+            "chart_query": {
+                "status": chart_query.get("status"),
+                "error": chart_query.get("error"),
+                "payload_source": chart_query.get("payload_source"),
+            },
+            "chart_render": (
+                {
+                    "status": chart_render.get("status"),
+                    "error": chart_render.get("error"),
+                    "critical_page_errors": chart_render.get("critical_page_errors"),
+                    "visible_errors": chart_render.get("visible_errors"),
+                }
+                if isinstance(chart_render, dict) else None
+            ),
+            "dashboard_query": (
+                {
+                    "dashboard_id": dashboard_query.get("dashboard_id"),
+                    "chart_count": dashboard_query.get("chart_count"),
+                    "validated": dashboard_query.get("validated"),
+                    "failed_count": len([
+                        item for item in dashboard_query.get("results", [])
+                        if isinstance(item, dict) and item.get("status") != "success"
+                    ]),
+                }
+                if isinstance(dashboard_query, dict) else None
+            ),
+            "dashboard_render": (
+                {
+                    "dashboard_id": dashboard_render.get("dashboard_id"),
+                    "chart_count": dashboard_render.get("chart_count"),
+                    "broken_count": dashboard_render.get("broken_count"),
+                }
+                if isinstance(dashboard_render, dict) else None
+            ),
+        }, indent=2, default=str)
+
+    return json.dumps(result, indent=2, default=str)
+
+
 # ===================================================================
 # Tools — Create operations
 # ===================================================================
@@ -1823,6 +1959,7 @@ def create_chart(
     metrics: list[Any] | str | None = None,
     groupby: list[str] | str | None = None,
     time_column: str | None = None,
+    template: Literal["auto", "minimal"] = "auto",
     params_json: str | None = None,
     dashboards: list[int] | str | None = None,
     validate_after_create: bool = True,
@@ -1843,6 +1980,8 @@ def create_chart(
         metrics: Metric names or ad-hoc metric objects
         groupby: Columns to group by
         time_column: Time column for time-series charts
+        template: Defaulting strategy for missing chart fields
+                  ('auto' or 'minimal')
         params_json: Optional JSON object to merge into chart params
         dashboards: Dashboard IDs to attach this chart to
         validate_after_create: Run chart-data validation after create
@@ -1855,6 +1994,8 @@ def create_chart(
     _require_dataset_exists(ws, dataset_id)
     dataset = ws.dataset_detail(dataset_id)
     _validate_viz_type(ws, viz_type)
+    if template not in ("auto", "minimal"):
+        raise ValueError("template must be one of: auto, minimal.")
 
     metrics_list = _coerce_list_arg(
         metrics, field_name="metrics", item_kind="any"
@@ -1883,6 +2024,13 @@ def create_chart(
             params_json,
             dataset_columns=dataset_columns,
             dataset_metrics=dataset_metrics,
+            viz_type=viz_type,
+            fallback_fields={
+                "metrics": metrics_list,
+                "groupby": groupby_list,
+                "granularity_sqla": time_column,
+                "time_column": time_column,
+            },
         )
         extra_params = parsed_params
 
@@ -1908,6 +2056,8 @@ def create_chart(
         fields.append("groupby")
     if time_column is not None:
         fields.append("time_column")
+    if template != "auto":
+        fields.append("template")
     if params_json is not None:
         fields.append("params_json")
     if dashboards_list is not None:
@@ -1927,12 +2077,14 @@ def create_chart(
             dataset_id, title, viz_type,
             metrics=metrics_list, groupby=groupby_list,
             time_column=time_column, dashboards=dashboards_list,
+            template=template,
             **extra_params,
         ),
         preview_extras={"values": {
             "dataset_id": dataset_id, "title": title, "viz_type": viz_type,
             "metrics": metrics_list, "groupby": groupby_list,
-            "time_column": time_column, "params_json": params_json,
+            "time_column": time_column, "template": template,
+            "params_json": params_json,
             "dashboards": dashboards_list,
             "validate_after_create": validate_after_create,
             "repair_dashboard_refs": repair_dashboard_refs,
@@ -2116,6 +2268,11 @@ def update_chart(
     if params_json is not None:
         dataset_columns: set[str] = set()
         dataset_metrics: set[str] = set()
+        resolved_viz_type = viz_type
+        if resolved_viz_type is None:
+            existing_viz = before.get("viz_type")
+            if isinstance(existing_viz, str) and existing_viz:
+                resolved_viz_type = existing_viz
         if chart_dataset_id is not None:
             try:
                 dataset = ws.dataset_detail(chart_dataset_id)
@@ -2128,6 +2285,7 @@ def update_chart(
             params_json,
             dataset_columns=dataset_columns,
             dataset_metrics=dataset_metrics,
+            viz_type=resolved_viz_type,
         )
 
     kwargs: dict[str, Any] = {}

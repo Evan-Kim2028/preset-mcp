@@ -301,6 +301,8 @@ def validate_params_payload(
     *,
     dataset_columns: set[str] | None = None,
     dataset_metrics: set[str] | None = None,
+    viz_type: str | None = None,
+    fallback_fields: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Parse + validate params_json and return advisory warnings.
 
@@ -331,6 +333,12 @@ def validate_params_payload(
     warnings: list[str] = []
     dataset_columns = dataset_columns or set()
     dataset_metrics = dataset_metrics or set()
+    fallback_fields = fallback_fields or {}
+    resolved_viz_type = viz_type
+    if not resolved_viz_type:
+        raw_viz_type = parsed.get("viz_type")
+        if isinstance(raw_viz_type, str) and raw_viz_type:
+            resolved_viz_type = raw_viz_type
 
     metrics = parsed.get("metrics")
     metric_column_refs: set[str] = set()
@@ -389,6 +397,44 @@ def validate_params_payload(
             "params_json metric labels collide with dimension labels: "
             f"{metric_dimension_collisions}."
         )
+
+    def _is_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, (list, tuple, set, dict)):
+            return len(value) == 0
+        return False
+
+    def _value(key: str) -> Any:
+        if key in parsed:
+            return parsed.get(key)
+        return fallback_fields.get(key)
+
+    if resolved_viz_type == "pie":
+        if _is_missing(_value("metrics")):
+            raise ValueError("Pie charts require params_json.metrics.")
+        has_dimension = not _is_missing(_value("groupby")) or not _is_missing(_value("columns"))
+        if not has_dimension:
+            raise ValueError("Pie charts require params_json.groupby (or columns).")
+
+    if resolved_viz_type in {
+        "echarts_timeseries_bar",
+        "echarts_timeseries_line",
+        "echarts_timeseries_area",
+    }:
+        if _is_missing(_value("metrics")):
+            raise ValueError(f"{resolved_viz_type} requires params_json.metrics.")
+        has_time = not _is_missing(_value("granularity_sqla")) or not _is_missing(_value("time_column"))
+        if not has_time:
+            raise ValueError(
+                f"{resolved_viz_type} requires a time column "
+                "(granularity_sqla or time_column)."
+            )
+
+    if resolved_viz_type == "big_number_total" and _is_missing(_value("metrics")):
+        raise ValueError("big_number_total requires params_json.metrics.")
 
     if dataset_columns and referenced_columns:
         missing = sorted(

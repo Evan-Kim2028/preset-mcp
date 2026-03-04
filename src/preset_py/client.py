@@ -7,7 +7,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 from yarl import URL
@@ -75,6 +75,23 @@ def _column_map(dataset: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return mapped
 
 
+def _dataset_columns(dataset: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return dataset columns as a normalized list of dicts."""
+    columns = dataset.get("columns", [])
+    if not isinstance(columns, list):
+        return []
+    return [column for column in columns if isinstance(column, dict)]
+
+
+def _column_name(column: dict[str, Any]) -> str | None:
+    """Extract a normalized dataset column name."""
+    for key in ("column_name", "name"):
+        value = column.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _column_type_name(column: dict[str, Any]) -> str:
     """Return a normalized type name from dataset column metadata."""
     for key in ("type", "type_generic", "python_date_format"):
@@ -92,6 +109,15 @@ def _is_numeric_column(column: dict[str, Any]) -> bool:
         "REAL", "BIGINT", "SMALLINT", "TINYINT",
     )
     return any(token in type_name for token in numeric_tokens)
+
+
+def _is_temporal_column(column: dict[str, Any]) -> bool:
+    """Best-effort temporal column detection from dataset metadata."""
+    if column.get("is_dttm") is True:
+        return True
+    type_name = _column_type_name(column)
+    temporal_tokens = ("DATE", "TIME", "TIMESTAMP", "DATETIME")
+    return any(token in type_name for token in temporal_tokens)
 
 
 def _simple_metric_from_column(column_name: str, column: dict[str, Any]) -> dict[str, Any]:
@@ -138,6 +164,127 @@ def _normalize_create_metrics(
     return normalized
 
 
+def _saved_metric_name(metric: Any) -> str | None:
+    """Extract metric name from dataset metric payload shapes."""
+    if isinstance(metric, str) and metric:
+        return metric
+    if not isinstance(metric, dict):
+        return None
+    for key in ("metric_name", "label", "name"):
+        value = metric.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _default_metric(dataset: dict[str, Any]) -> Any:
+    """Choose a robust default metric for chart bootstrapping."""
+    metrics = dataset.get("metrics", [])
+    if isinstance(metrics, list):
+        for metric in metrics:
+            name = _saved_metric_name(metric)
+            if name:
+                return name
+
+    for column in _dataset_columns(dataset):
+        name = _column_name(column)
+        if not name:
+            continue
+        if _is_numeric_column(column):
+            return _simple_metric_from_column(name, column)
+
+    return {
+        "expressionType": "SQL",
+        "sqlExpression": "COUNT(*)",
+        "label": "COUNT(*)",
+        "optionName": "metric_count_star",
+    }
+
+
+def _default_dimension_column(dataset: dict[str, Any]) -> str | None:
+    """Choose a default grouping dimension for category-based charts."""
+    columns = _dataset_columns(dataset)
+    for column in columns:
+        name = _column_name(column)
+        if not name:
+            continue
+        if _is_temporal_column(column):
+            continue
+        if not _is_numeric_column(column):
+            return name
+    for column in columns:
+        name = _column_name(column)
+        if not name:
+            continue
+        if not _is_temporal_column(column):
+            return name
+    for column in columns:
+        name = _column_name(column)
+        if name:
+            return name
+    return None
+
+
+def _default_time_column(dataset: dict[str, Any]) -> str | None:
+    """Choose a default time column for timeseries charts."""
+    for column in _dataset_columns(dataset):
+        name = _column_name(column)
+        if name and _is_temporal_column(column):
+            return name
+    return None
+
+
+def _apply_chart_defaults(
+    viz_type: str,
+    dataset: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    template: Literal["auto", "minimal"] = "auto",
+) -> None:
+    """Apply sane defaults so minimal chart inputs become renderable."""
+    if template == "minimal":
+        return
+
+    if viz_type == "pie":
+        params.setdefault("show_legend", True)
+        params.setdefault("labels_outside", True)
+        if not _coerce_list(params.get("metrics")):
+            params["metrics"] = [_default_metric(dataset)]
+        if not _coerce_list(params.get("groupby")) and not _coerce_list(params.get("columns")):
+            dimension = _default_dimension_column(dataset)
+            if not dimension:
+                raise ValueError(
+                    "Could not infer a groupby dimension for pie chart. "
+                    "Pass groupby explicitly."
+                )
+            params["groupby"] = [dimension]
+        return
+
+    if viz_type in {"echarts_timeseries_bar", "echarts_timeseries_line", "echarts_timeseries_area"}:
+        if not _coerce_list(params.get("metrics")):
+            params["metrics"] = [_default_metric(dataset)]
+        if not params.get("granularity_sqla"):
+            inferred_time = _default_time_column(dataset)
+            if inferred_time:
+                params["granularity_sqla"] = inferred_time
+        if params.get("granularity_sqla"):
+            params.setdefault("time_grain_sqla", "P1D")
+        return
+
+    if viz_type == "big_number_total":
+        if not _coerce_list(params.get("metrics")):
+            params["metrics"] = [_default_metric(dataset)]
+        return
+
+    if viz_type == "table":
+        if not _coerce_list(params.get("metrics")):
+            params["metrics"] = [_default_metric(dataset)]
+        if not _coerce_list(params.get("columns")) and not _coerce_list(params.get("groupby")):
+            dimension = _default_dimension_column(dataset)
+            if dimension:
+                params["columns"] = [dimension]
+
+
 def _validate_groupby_columns(groupby: list[str], dataset: dict[str, Any]) -> None:
     """Fail fast when groupby references missing dataset columns."""
     columns = set(_column_map(dataset).keys())
@@ -160,6 +307,7 @@ def _create_chart(
     time_column: str | None = None,
     dashboards: list[int] | None = None,
     extra_params: dict[str, Any] | None = None,
+    template: Literal["auto", "minimal"] = "auto",
 ) -> dict[str, Any]:
     """Create a chart with sensible defaults.
 
@@ -183,6 +331,8 @@ def _create_chart(
         params["groupby"] = groupby
     if time_column:
         params["granularity_sqla"] = time_column
+
+    _apply_chart_defaults(viz_type, dataset, params, template=template)
 
     if extra_params:
         params.update(extra_params)
@@ -1364,6 +1514,7 @@ class PresetWorkspace:
         groupby: list[str] | None = None,
         time_column: str | None = None,
         dashboards: list[int] | None = None,
+        template: Literal["auto", "minimal"] = "auto",
         **extra_params: Any,
     ) -> dict[str, Any]:
         return _create_chart(
@@ -1376,6 +1527,7 @@ class PresetWorkspace:
             time_column=time_column,
             dashboards=dashboards,
             extra_params=extra_params or None,
+            template=template,
         )
 
     # ------------------------------------------------------------------

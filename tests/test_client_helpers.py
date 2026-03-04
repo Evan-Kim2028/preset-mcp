@@ -80,3 +80,20 @@ def test_create_chart_rejects_unknown_groupby_columns() -> None:
             metrics=["VOLUME_M"],
             groupby=["NOT_A_REAL_COLUMN"],
         )
+
+
+def test_create_chart_auto_defaults_for_pie_without_metrics_or_groupby() -> None:
+    client = _DatasetClient()
+    result = _create_chart(
+        client,
+        dataset_id=10,
+        title="Bridge Share",
+        viz_type="pie",
+    )
+    assert result["id"] == 77
+    assert client.created_chart_payload is not None
+
+    params = json.loads(client.created_chart_payload["params"])
+    assert params["groupby"] == ["BRIDGE"]
+    assert isinstance(params["metrics"], list)
+    assert params["metrics"][0]["expressionType"] == "SIMPLE"
