@@ -15,11 +15,73 @@ def test_params_payload_rejects_invalid_metric_shape() -> None:
         )
 
 
-def test_params_payload_warns_on_unknown_columns() -> None:
-    _, warnings = validate_params_payload(
-        '{"groupby":["known_col"],"filters":[{"col":"missing_col"}]}',
-        dataset_columns={"known_col"},
-        dataset_metrics={"saved_metric"},
-    )
-    assert warnings
-    assert "unknown dataset columns" in warnings[0]
+def test_params_payload_rejects_unknown_columns() -> None:
+    with pytest.raises(ValueError, match="unknown dataset columns"):
+        validate_params_payload(
+            '{"groupby":["known_col"],"filters":[{"col":"missing_col"}]}',
+            dataset_columns={"known_col"},
+            dataset_metrics={"saved_metric"},
+        )
+
+
+def test_params_payload_rejects_unknown_axis_column() -> None:
+    with pytest.raises(ValueError, match="unknown dataset columns"):
+        validate_params_payload(
+            '{"x_axis":"BAD_COLUMN","groupby":["known_col"]}',
+            dataset_columns={"known_col"},
+            dataset_metrics={"saved_metric"},
+        )
+
+
+def test_params_payload_rejects_duplicate_dimension_labels() -> None:
+    with pytest.raises(ValueError, match="duplicate dimension labels"):
+        validate_params_payload(
+            '{"x_axis":"CHAIN","groupby":["CHAIN"]}',
+            dataset_columns={"CHAIN"},
+            dataset_metrics={"count"},
+        )
+
+
+def test_params_payload_rejects_metric_dimension_label_collision() -> None:
+    with pytest.raises(ValueError, match="metric labels collide"):
+        validate_params_payload(
+            '{"groupby":["CHAIN"],"metrics":["CHAIN"]}',
+            dataset_columns={"CHAIN"},
+            dataset_metrics={"count"},
+        )
+
+
+def test_params_payload_enforces_pie_required_fields() -> None:
+    with pytest.raises(ValueError, match="Pie charts require params_json.metrics"):
+        validate_params_payload(
+            '{"groupby":["CHAIN"]}',
+            dataset_columns={"CHAIN"},
+            dataset_metrics={"count"},
+            viz_type="pie",
+        )
+
+    with pytest.raises(ValueError, match="Pie charts require params_json.groupby"):
+        validate_params_payload(
+            '{"metrics":["count"]}',
+            dataset_columns={"CHAIN"},
+            dataset_metrics={"count"},
+            viz_type="pie",
+        )
+
+
+def test_params_payload_enforces_timeseries_required_fields() -> None:
+    with pytest.raises(ValueError, match="requires params_json.metrics"):
+        validate_params_payload(
+            '{"granularity_sqla":"DAY"}',
+            dataset_columns={"DAY"},
+            dataset_metrics={"count"},
+            viz_type="echarts_timeseries_line",
+        )
+
+    with pytest.raises(ValueError, match="requires a time column"):
+        validate_params_payload(
+            '{"metrics":["count"]}',
+            dataset_columns={"DAY"},
+            dataset_metrics={"count"},
+            viz_type="echarts_timeseries_line",
+        )

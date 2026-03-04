@@ -42,7 +42,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 
 ```bash
 claude mcp list
-# Should show: preset-mcp  ... 23 tools
+# Should show: preset-mcp  ... 33 tools
 ```
 
 Then in a Claude Code session, try:
@@ -63,7 +63,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
   preset-mcp -- uv run --directory /path/to/preset-mcp preset-mcp
 ```
 
-## Tools (23)
+## Tools (33)
 
 ### Workspace Navigation
 
@@ -115,7 +115,17 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 |------|---------|
 | `validate_chart` | Validate a single chart via chart-data execution |
 | `validate_dashboard` | Validate all charts on a dashboard |
+| `validate_chart_render` | Validate chart rendering via headless browser probe |
+| `validate_dashboard_render` | Validate render status across dashboard charts |
+| `verify_chart_workflow` | One-shot chart→dashboard query/render verification |
+| `verify_dashboard_structure` | Validate dashboard layout graph and chart references |
+| `verify_dashboard_workflow` | One-shot dashboard structure/query/render verification |
 | `repair_dashboard_chart_refs` | Repair stale dashboard chart ID references |
+| `list_mutations` | Inspect local mutation audit journal entries |
+| `list_dashboard_snapshots` | List local pre-mutation dashboard snapshots |
+| `restore_dashboard_snapshot` | Restore dashboard layout/settings from local snapshot |
+| `capture_dashboard_template` | Capture reusable dashboard+chart template JSON |
+| `capture_golden_templates` | Batch-export templates from dashboard IDs |
 | `snapshot_workspace` | Full inventory dump for auditing |
 
 ## Typical Workflow
@@ -212,6 +222,84 @@ df = ws.run_sql("SELECT * FROM revenue LIMIT 10", database_id=1)
 
 ws.create_dataset("daily_revenue", "SELECT ...", database_id=1)
 ws.create_chart(dataset_id=5, title="Revenue", viz_type="echarts_timeseries_bar")
+```
+
+## Advanced Recipe: Pie Chart with Ad-hoc Metric
+
+Use `params_json` for advanced chart params such as ad-hoc filters.
+
+```json
+{
+  "dataset_id": 868,
+  "title": "USDSUI Distribution",
+  "viz_type": "pie",
+  "metrics": "[{\"expressionType\":\"SQL\",\"sqlExpression\":\"AVG(AMOUNT_USD)\",\"label\":\"AVG(AMOUNT_USD)\"}]",
+  "groupby": "[\"CATEGORY\",\"SOURCE_NAME\"]",
+  "params_json": "{\"adhoc_filters\":[{\"col\":\"TOKEN_SYMBOL\",\"op\":\"==\",\"val\":\"USDSUI\"}]}"
+}
+```
+
+Notes:
+- `create_chart.metrics` accepts saved metric names or ad-hoc metric objects.
+- `create_chart.template="auto"` applies viz-specific defaults for missing fields.
+- `params_json` is validated preflight against dataset columns/metrics.
+- `params_json` cannot include datasource-rebinding keys like `viz_type` or `datasource_id`.
+- `create_chart.repair_dashboard_refs` defaults to `false` so chart creation does not mutate dashboard layouts unless explicitly requested.
+
+## Strict Params Semantics
+
+- `update_chart(params_json=...)` uses strict validation semantics and treats `params_json` as a full viz-compatible params payload.
+- For viz types with required fields (for example `pie` and timeseries charts), partial payloads like only `{"color_scheme":"..."}` are rejected.
+- Use `get_chart(chart_id=<id>, response_mode="full")` to copy/edit the existing params JSON when you need precise updates.
+
+## Golden Template Workflow
+
+Use proven dashboards (for example BTC Fight, Walrus, DeepBook) as template sources:
+
+1. Find dashboard IDs:
+```text
+list_dashboards(response_mode="compact")
+```
+2. Verify layout/query/render health before templating:
+```text
+verify_dashboard_workflow(dashboard_id=<id>, include_render=true, response_mode="standard")
+```
+3. Export a single reusable template:
+```text
+capture_dashboard_template(
+  dashboard_id=<id>,
+  portable=true,
+  include_query_context=false,
+  include_dataset_schema=true,
+  output_path="~/.preset-mcp/golden-templates/<name>.json"
+)
+```
+4. Export multiple dashboards in one run:
+```text
+capture_golden_templates(
+  dashboard_ids="[80,97,162]",
+  output_dir="~/.preset-mcp/golden-templates",
+  portable=true,
+  include_dataset_schema=true
+)
+```
+
+CLI alternative:
+
+```bash
+uv run scripts/export_golden_templates.py \
+  --workspace "Mysten Labs--General" \
+  --dashboard-ids 80,103,102 \
+  --output-dir ~/.preset-mcp/golden-templates \
+  --overwrite
+```
+
+Optional live smoke test (skipped by default):
+
+```bash
+PRESET_MCP_ENABLE_LIVE_TESTS=1 \
+PRESET_MCP_LIVE_DASHBOARD_IDS=80,103,102 \
+uv run --with pytest pytest -q tests/test_live_dashboard_smoke.py
 ```
 
 ## License

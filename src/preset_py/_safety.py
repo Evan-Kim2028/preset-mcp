@@ -145,6 +145,19 @@ _FORBIDDEN_PARAM_KEYS = frozenset({
     "viz_type",
 })
 
+_VIZ_DIMENSION_KEYS = (
+    "groupby",
+    "columns",
+    "x_axis",
+    "xAxis",
+    "y_axis",
+    "left_axis",
+    "right_axis",
+    "series",
+    "time_column",
+    "granularity_sqla",
+)
+
 def _metric_column_name(metric: dict[str, Any]) -> str | None:
     """Extract a metric's referenced column name, if present."""
     column = metric.get("column")
@@ -155,6 +168,30 @@ def _metric_column_name(metric: dict[str, Any]) -> str | None:
         if isinstance(name, str):
             return name
     return None
+
+
+def _metric_label(metric: Any) -> str | None:
+    """Derive the effective metric label Superset uses for display/orderby."""
+    if isinstance(metric, str):
+        return metric
+    if not isinstance(metric, dict):
+        return None
+
+    for key in ("label", "label_short", "metric_name", "name"):
+        value = metric.get(key)
+        if isinstance(value, str) and value:
+            return value
+
+    if metric.get("expressionType") == "SQL":
+        sql_expr = metric.get("sqlExpression")
+        if isinstance(sql_expr, str) and sql_expr.strip():
+            return sql_expr.strip()
+
+    col_name = _metric_column_name(metric)
+    aggregate = metric.get("aggregate")
+    if isinstance(aggregate, str) and aggregate and col_name:
+        return f"{aggregate}({col_name})"
+    return col_name
 
 
 def _validate_metric_object(metric: dict[str, Any], index: int) -> str | None:
@@ -224,14 +261,39 @@ def _extract_filter_columns(filters: Any) -> set[str]:
 
 
 def _extract_named_columns(value: Any) -> set[str]:
-    """Extract string column names from list-like params entries."""
+    """Extract string column names from scalar/list/dict-like values."""
     refs: set[str] = set()
-    if not isinstance(value, list):
+    if isinstance(value, str):
+        if value:
+            refs.add(value)
+        return refs
+    if isinstance(value, dict):
+        # Common field payload shapes: {"column_name": "x"}, {"column": "x"}
+        for key in ("column_name", "name", "col", "column"):
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                refs.add(item)
+        if isinstance(value.get("column"), dict):
+            nested = value["column"]
+            col_name = nested.get("column_name") or nested.get("name")
+            if isinstance(col_name, str) and col_name:
+                refs.add(col_name)
+        return refs
+    if not isinstance(value, list | tuple | set):
         return refs
     for item in value:
-        if isinstance(item, str) and item:
-            refs.add(item)
+        refs.update(_extract_named_columns(item))
     return refs
+
+
+def _dimension_label_sources(parsed: dict[str, Any]) -> dict[str, set[str]]:
+    """Return label -> set(fields) for dimension-like chart fields."""
+    sources: dict[str, set[str]] = {}
+    for field in _VIZ_DIMENSION_KEYS:
+        labels = _extract_named_columns(parsed.get(field))
+        for label in labels:
+            sources.setdefault(label, set()).add(field)
+    return sources
 
 
 def validate_params_payload(
@@ -239,6 +301,8 @@ def validate_params_payload(
     *,
     dataset_columns: set[str] | None = None,
     dataset_metrics: set[str] | None = None,
+    viz_type: str | None = None,
+    fallback_fields: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Parse + validate params_json and return advisory warnings.
 
@@ -269,14 +333,22 @@ def validate_params_payload(
     warnings: list[str] = []
     dataset_columns = dataset_columns or set()
     dataset_metrics = dataset_metrics or set()
+    fallback_fields = fallback_fields or {}
+    resolved_viz_type = viz_type
+    if not resolved_viz_type:
+        raw_viz_type = parsed.get("viz_type")
+        if isinstance(raw_viz_type, str) and raw_viz_type:
+            resolved_viz_type = raw_viz_type
 
     metrics = parsed.get("metrics")
     metric_column_refs: set[str] = set()
+    metric_labels: set[str] = set()
     if metrics is not None:
         if not isinstance(metrics, list):
             raise ValueError("params_json.metrics must be a list.")
         for idx, metric in enumerate(metrics):
             if isinstance(metric, str):
+                metric_labels.add(metric)
                 if (
                     dataset_columns
                     and dataset_metrics
@@ -291,24 +363,90 @@ def validate_params_payload(
                 ref = _validate_metric_object(metric, idx)
                 if ref:
                     metric_column_refs.add(ref)
+                label = _metric_label(metric)
+                if label:
+                    metric_labels.add(label)
                 continue
             raise ValueError(
                 f"metrics[{idx}] must be a string or metric object dict."
             )
 
     referenced_columns: set[str] = set()
-    referenced_columns.update(_extract_named_columns(parsed.get("groupby")))
-    referenced_columns.update(_extract_named_columns(parsed.get("columns")))
+    label_sources = _dimension_label_sources(parsed)
+    referenced_columns.update(label_sources.keys())
     referenced_columns.update(_extract_filter_columns(parsed.get("filters")))
     referenced_columns.update(_extract_filter_columns(parsed.get("adhoc_filters")))
     referenced_columns.update(metric_column_refs)
 
+    duplicate_dimensions = sorted(
+        label for label, fields in label_sources.items() if len(fields) > 1
+    )
+    if duplicate_dimensions:
+        details = ", ".join(
+            f"{label!r} in {sorted(label_sources[label])}"
+            for label in duplicate_dimensions
+        )
+        raise ValueError(
+            "params_json has duplicate dimension labels across chart fields: "
+            f"{details}."
+        )
+
+    metric_dimension_collisions = sorted(metric_labels & set(label_sources.keys()))
+    if metric_dimension_collisions:
+        raise ValueError(
+            "params_json metric labels collide with dimension labels: "
+            f"{metric_dimension_collisions}."
+        )
+
+    def _is_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, (list, tuple, set, dict)):
+            return len(value) == 0
+        return False
+
+    def _value(key: str) -> Any:
+        if key in parsed:
+            return parsed.get(key)
+        return fallback_fields.get(key)
+
+    if resolved_viz_type == "pie":
+        if _is_missing(_value("metrics")):
+            raise ValueError("Pie charts require params_json.metrics.")
+        has_dimension = not _is_missing(_value("groupby")) or not _is_missing(_value("columns"))
+        if not has_dimension:
+            raise ValueError("Pie charts require params_json.groupby (or columns).")
+
+    if resolved_viz_type in {
+        "echarts_timeseries_bar",
+        "echarts_timeseries_line",
+        "echarts_timeseries_area",
+    }:
+        if _is_missing(_value("metrics")):
+            raise ValueError(f"{resolved_viz_type} requires params_json.metrics.")
+        has_time = not _is_missing(_value("granularity_sqla")) or not _is_missing(_value("time_column"))
+        if not has_time:
+            raise ValueError(
+                f"{resolved_viz_type} requires a time column "
+                "(granularity_sqla or time_column)."
+            )
+
+    if resolved_viz_type == "big_number_total" and _is_missing(_value("metrics")):
+        raise ValueError("big_number_total requires params_json.metrics.")
+
     if dataset_columns and referenced_columns:
-        missing = sorted(col for col in referenced_columns if col not in dataset_columns)
+        missing = sorted(
+            col
+            for col in referenced_columns
+            if col not in dataset_columns and col not in dataset_metrics
+        )
         if missing:
-            warnings.append(
+            raise ValueError(
                 "params_json references unknown dataset columns: "
-                f"{missing}."
+                f"{missing}. Use get_dataset(..., response_mode='standard') "
+                "to inspect valid columns/metrics."
             )
 
     return parsed, warnings
