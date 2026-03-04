@@ -42,7 +42,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 
 ```bash
 claude mcp list
-# Should show: preset-mcp  ... 23 tools
+# Should show: preset-mcp  ... 28 tools
 ```
 
 Then in a Claude Code session, try:
@@ -63,7 +63,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
   preset-mcp -- uv run --directory /path/to/preset-mcp preset-mcp
 ```
 
-## Tools (23)
+## Tools (28)
 
 ### Workspace Navigation
 
@@ -115,7 +115,12 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 |------|---------|
 | `validate_chart` | Validate a single chart via chart-data execution |
 | `validate_dashboard` | Validate all charts on a dashboard |
+| `validate_chart_render` | Validate chart rendering via headless browser probe |
+| `validate_dashboard_render` | Validate render status across dashboard charts |
 | `repair_dashboard_chart_refs` | Repair stale dashboard chart ID references |
+| `list_mutations` | Inspect local mutation audit journal entries |
+| `list_dashboard_snapshots` | List local pre-mutation dashboard snapshots |
+| `restore_dashboard_snapshot` | Restore dashboard layout/settings from local snapshot |
 | `snapshot_workspace` | Full inventory dump for auditing |
 
 ## Typical Workflow
@@ -213,6 +218,26 @@ df = ws.run_sql("SELECT * FROM revenue LIMIT 10", database_id=1)
 ws.create_dataset("daily_revenue", "SELECT ...", database_id=1)
 ws.create_chart(dataset_id=5, title="Revenue", viz_type="echarts_timeseries_bar")
 ```
+
+## Advanced Recipe: Pie Chart with Ad-hoc Metric
+
+Use `params_json` for advanced chart params such as ad-hoc filters.
+
+```json
+{
+  "dataset_id": 868,
+  "title": "USDSUI Distribution",
+  "viz_type": "pie",
+  "metrics": "[{\"expressionType\":\"SQL\",\"sqlExpression\":\"AVG(AMOUNT_USD)\",\"label\":\"AVG(AMOUNT_USD)\"}]",
+  "groupby": "[\"CATEGORY\",\"SOURCE_NAME\"]",
+  "params_json": "{\"adhoc_filters\":[{\"col\":\"TOKEN_SYMBOL\",\"op\":\"==\",\"val\":\"USDSUI\"}]}"
+}
+```
+
+Notes:
+- `create_chart.metrics` accepts saved metric names or ad-hoc metric objects.
+- `params_json` is validated preflight against dataset columns/metrics.
+- `params_json` cannot include datasource-rebinding keys like `viz_type` or `datasource_id`.
 
 ## License
 

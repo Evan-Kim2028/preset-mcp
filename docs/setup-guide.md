@@ -74,7 +74,7 @@ claude mcp list
 You should see:
 
 ```
-preset-mcp · 23 tools
+preset-mcp · 28 tools
 ```
 
 If it shows `failed`, check:
@@ -174,4 +174,4 @@ Either set `PRESET_WORKSPACE` in your config (Step 3) or tell Claude:
 
 ### Tools not appearing
 
-Restart Claude Code after adding the MCP. Check `claude mcp list` shows 23 tools.
+Restart Claude Code after adding the MCP. Check `claude mcp list` shows 28 tools.

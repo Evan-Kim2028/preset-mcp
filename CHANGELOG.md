@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0 - 2026-03-04
+
+### Fixed
+- `query_dataset` now uses a direct chart-data payload path instead of relying
+  on `preset-cli` `get_data()` assumptions that could fail on non-time-series
+  datasets (for example `SELECT 1` datasets with no datetime column).
+- `create_chart` now accepts ad-hoc metric objects and optional `params_json`
+  for richer chart creation workflows (including pie charts with ad-hoc filters).
+- Improved chart-data API error translation for opaque `orderby` failures with
+  actionable remediation text.
+- `update_dashboard` now accepts dict or JSON string payloads for
+  `position_json` and `json_metadata`, normalizes them, and preflight-validates
+  layout structure (required root/grid nodes + reference integrity).
+- `validate_params_payload` now checks viz-axis/dimension fields and fails fast
+  on unknown referenced columns.
+- Added duplicate-label linting in params validation:
+  - duplicate dimension labels across fields (for example `x_axis` + `groupby`)
+  - metric/dimension label collisions.
+
+### Added
+- Local audit/recovery MCP tools:
+  - `list_mutations`
+  - `list_dashboard_snapshots`
+  - `restore_dashboard_snapshot`
+
+### Quality
+- Added regression tests covering:
+  - non-time-series `query_dataset` reliability and empty API errors
+  - orderby-null error translation in chart validation
+  - viz-field validation and label-collision failures
+  - ad-hoc metric + `params_json` create-chart path
+  - dict-based dashboard layout update serialization and layout preflight checks
+  - local mutation journal and dashboard snapshot restore tools
+
 ## 0.5.2 - 2026-02-16
 
 ### Fixed

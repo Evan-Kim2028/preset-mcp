@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from yarl import URL
 
 from preset_py.client import PresetWorkspace, _critical_page_errors
@@ -165,3 +166,85 @@ def test_critical_page_errors_filters_known_noise() -> None:
     ]
     critical = _critical_page_errors(page_errors)
     assert critical == ["TypeError: Cannot read properties of undefined (reading 'foo')"]
+
+
+def test_query_dataset_works_without_datetime_column() -> None:
+    response = _FakeResponse(
+        200,
+        {
+            "result": [
+                {
+                    "status": "success",
+                    "error": None,
+                    "data": [{"x": 1}],
+                }
+            ]
+        },
+    )
+    client = _FakeSupersetClient(response)
+    ws = PresetWorkspace.__new__(PresetWorkspace)
+    ws._superset = client
+
+    df = ws.query_dataset(
+        dataset_id=814,
+        metrics=["count"],
+        columns=["TOKEN"],
+        is_timeseries=False,
+    )
+
+    assert client.session.last_payload is not None
+    query = client.session.last_payload["queries"][0]
+    assert query["is_timeseries"] is False
+    assert query["time_range"] == "No filter"
+    assert df.to_dict("records") == [{"x": 1}]
+
+
+def test_query_dataset_surfaces_empty_api_error() -> None:
+    response = _FakeResponse(400, {})
+    client = _FakeSupersetClient(response)
+    ws = PresetWorkspace.__new__(PresetWorkspace)
+    ws._superset = client
+
+    with pytest.raises(ValueError, match="empty API error payload"):
+        ws.query_dataset(
+            dataset_id=814,
+            metrics=["count"],
+            columns=[],
+        )
+
+
+def test_validate_chart_translates_orderby_null_errors() -> None:
+    chart = {
+        "id": 4,
+        "slice_name": "Orderby Error",
+        "query_context": None,
+        "datasource_id": 42,
+        "datasource_type": "table",
+        "params": json.dumps(
+            {
+                "datasource": "42__table",
+                "groupby": ["TOKEN"],
+                "metrics": ["count"],
+            }
+        ),
+    }
+    response = _FakeResponse(
+        400,
+        {
+            "message": {
+                "queries": {
+                    "0": {
+                        "orderby": {
+                            "0": {"0": ["Field may not be null."]},
+                        },
+                    }
+                }
+            }
+        },
+    )
+    ws, _client = _workspace_with(chart=chart, form_data=None, response=response)
+
+    result = ws.validate_chart_data(4, dashboard_id=None)
+
+    assert result["status"] == "request_failed"
+    assert "invalid metric key" in str(result["error"])

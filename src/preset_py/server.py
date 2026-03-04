@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from difflib import get_close_matches
 from collections.abc import Callable
 from pathlib import Path
@@ -344,7 +345,7 @@ def _coerce_list_arg(
     value: list[Any] | tuple[Any, ...] | str | None,
     *,
     field_name: str,
-    item_kind: Literal["str", "int"],
+    item_kind: Literal["str", "int", "any"],
 ) -> list[Any] | None:
     """Accept native list or JSON-string list for MCP arguments."""
     if value is None:
@@ -373,6 +374,10 @@ def _coerce_list_arg(
 
     normalized: list[Any] = []
     for idx, item in enumerate(raw):
+        if item_kind == "any":
+            normalized.append(item)
+            continue
+
         if item_kind == "str":
             if item is None:
                 raise ValueError(f"{field_name}[{idx}] must not be null.")
@@ -627,6 +632,59 @@ def _dashboard_orphan_refs(
 
 def _layout_chart_ids(position_json: Any) -> set[int]:
     return set(_extract_position_chart_refs(position_json).values())
+
+
+def _validate_position_layout(position_json: dict[str, Any]) -> None:
+    """Preflight-check dashboard layout structure for common invalid shapes."""
+    if not position_json:
+        return
+
+    missing = [node for node in ("ROOT_ID", "GRID_ID") if node not in position_json]
+    if missing:
+        raise ValueError(
+            "position_json is missing required nodes: "
+            f"{missing}. Expected at least ROOT_ID and GRID_ID."
+        )
+
+    root = position_json.get("ROOT_ID")
+    grid = position_json.get("GRID_ID")
+    if not isinstance(root, dict) or not isinstance(grid, dict):
+        raise ValueError("position_json ROOT_ID and GRID_ID must be JSON objects.")
+
+    root_children = root.get("children")
+    if not isinstance(root_children, list) or "GRID_ID" not in [
+        str(child) for child in root_children
+    ]:
+        raise ValueError(
+            "position_json ROOT_ID.children must include GRID_ID."
+        )
+
+    for node_id, node in position_json.items():
+        if node_id == "DASHBOARD_VERSION_KEY":
+            continue
+        if not isinstance(node, dict):
+            continue
+
+        children = node.get("children")
+        if children is None:
+            children = []
+        if not isinstance(children, list):
+            raise ValueError(
+                f"position_json[{node_id!r}].children must be a list."
+            )
+        for child in children:
+            child_id = str(child)
+            if child_id not in position_json:
+                raise ValueError(
+                    "position_json has dangling child reference: "
+                    f"{node_id!r} -> {child_id!r}."
+                )
+
+        parents = node.get("parents")
+        if parents is not None and not isinstance(parents, list):
+            raise ValueError(
+                f"position_json[{node_id!r}].parents must be a list when provided."
+            )
 
 
 def _chart_title(entry: dict[str, Any]) -> str | None:
@@ -1762,9 +1820,10 @@ def create_chart(
     dataset_id: int,
     title: str,
     viz_type: str,
-    metrics: list[str] | str | None = None,
+    metrics: list[Any] | str | None = None,
     groupby: list[str] | str | None = None,
     time_column: str | None = None,
+    params_json: str | None = None,
     dashboards: list[int] | str | None = None,
     validate_after_create: bool = True,
     repair_dashboard_refs: bool = True,
@@ -1781,9 +1840,10 @@ def create_chart(
         title: Chart title
         viz_type: Visualization type (e.g. "echarts_timeseries_bar",
                   "pie", "big_number_total", "table")
-        metrics: Metric column names
+        metrics: Metric names or ad-hoc metric objects
         groupby: Columns to group by
         time_column: Time column for time-series charts
+        params_json: Optional JSON object to merge into chart params
         dashboards: Dashboard IDs to attach this chart to
         validate_after_create: Run chart-data validation after create
         repair_dashboard_refs: Attempt to repair stale dashboard chart
@@ -1793,11 +1853,18 @@ def create_chart(
     """
     ws = _get_ws()
     _require_dataset_exists(ws, dataset_id)
+    dataset = ws.dataset_detail(dataset_id)
     _validate_viz_type(ws, viz_type)
 
     metrics_list = _coerce_list_arg(
-        metrics, field_name="metrics", item_kind="str"
+        metrics, field_name="metrics", item_kind="any"
     )
+    if metrics_list is not None:
+        for idx, metric in enumerate(metrics_list):
+            if not isinstance(metric, str | dict):
+                raise ValueError(
+                    f"metrics[{idx}] must be a string or metric object."
+                )
     groupby_list = _coerce_list_arg(
         groupby, field_name="groupby", item_kind="str"
     )
@@ -1807,6 +1874,33 @@ def create_chart(
     if dashboards_list:
         _require_dashboards_exist(ws, dashboards_list)
 
+    dataset_columns = _dataset_columns(dataset)
+    dataset_metrics = _dataset_metrics(dataset)
+    params_warnings: list[str] = []
+    extra_params: dict[str, Any] = {}
+    if params_json is not None:
+        parsed_params, params_warnings = validate_params_payload(
+            params_json,
+            dataset_columns=dataset_columns,
+            dataset_metrics=dataset_metrics,
+        )
+        extra_params = parsed_params
+
+        if metrics_list is not None and "metrics" in parsed_params:
+            raise ValueError(
+                "Provide metrics in either the metrics argument or params_json.metrics, "
+                "not both."
+            )
+        if groupby_list is not None and "groupby" in parsed_params:
+            raise ValueError(
+                "Provide groupby in either the groupby argument or params_json.groupby, "
+                "not both."
+            )
+        if time_column is not None and "granularity_sqla" in parsed_params:
+            raise ValueError(
+                "Provide time_column directly or via params_json.granularity_sqla, not both."
+            )
+
     fields = ["dataset_id", "title", "viz_type"]
     if metrics_list is not None:
         fields.append("metrics")
@@ -1814,6 +1908,8 @@ def create_chart(
         fields.append("groupby")
     if time_column is not None:
         fields.append("time_column")
+    if params_json is not None:
+        fields.append("params_json")
     if dashboards_list is not None:
         fields.append("dashboards")
     if validate_after_create:
@@ -1831,11 +1927,13 @@ def create_chart(
             dataset_id, title, viz_type,
             metrics=metrics_list, groupby=groupby_list,
             time_column=time_column, dashboards=dashboards_list,
+            **extra_params,
         ),
         preview_extras={"values": {
             "dataset_id": dataset_id, "title": title, "viz_type": viz_type,
             "metrics": metrics_list, "groupby": groupby_list,
-            "time_column": time_column, "dashboards": dashboards_list,
+            "time_column": time_column, "params_json": params_json,
+            "dashboards": dashboards_list,
             "validate_after_create": validate_after_create,
             "repair_dashboard_refs": repair_dashboard_refs,
         }},
@@ -1845,9 +1943,11 @@ def create_chart(
         return raw
 
     payload = json.loads(raw)
+    if params_warnings:
+        payload["_params_warnings"] = params_warnings
     chart_id = _to_int(payload.get("id"))
     if chart_id is None:
-        return raw
+        return json.dumps(payload, indent=2, default=str)
 
     if repair_dashboard_refs and dashboards_list:
         repairs: list[dict[str, Any]] = []
@@ -2077,8 +2177,8 @@ def update_dashboard(
     dashboard_id: int,
     dashboard_title: str | None = None,
     published: bool | None = None,
-    position_json: str | None = None,
-    json_metadata: str | None = None,
+    position_json: dict[str, Any] | str | None = None,
+    json_metadata: dict[str, Any] | str | None = None,
     allow_empty_layout: bool = False,
     dry_run: bool = False,
 ) -> str:
@@ -2091,12 +2191,12 @@ def update_dashboard(
         dashboard_id: ID of the dashboard to update
         dashboard_title: New dashboard title
         published: Set to True to publish, False to unpublish
-        position_json: JSON string defining the dashboard layout (chart
-            containers, rows, grid). Use this to add, remove, or
-            rearrange chart containers — e.g. after deleting charts
-            whose containers remain as orphaned placeholders.
-        json_metadata: JSON string with dashboard metadata (cross-filter
-            config, color schemes, label colors, refresh settings).
+        position_json: JSON object (or JSON string) defining the dashboard
+            layout (chart containers, rows, grid). Use this to add,
+            remove, or rearrange chart containers — e.g. after deleting
+            charts whose containers remain as orphaned placeholders.
+        json_metadata: JSON object (or JSON string) with dashboard metadata
+            (cross-filter config, color schemes, label colors, refresh settings).
             Update this alongside position_json to keep chart references
             in sync.
         allow_empty_layout: If True, allow updates that remove all chart
@@ -2110,22 +2210,14 @@ def update_dashboard(
         kwargs["dashboard_title"] = dashboard_title
     if published is not None:
         kwargs["published"] = published
-    if position_json is not None:
-        kwargs["position_json"] = position_json
-    if json_metadata is not None:
-        kwargs["json_metadata"] = json_metadata
-
-    if not kwargs:
-        raise ValueError(
-            "Provide at least one field to update "
-            "(dashboard_title, published, position_json, or json_metadata)."
-        )
 
     ws = _get_ws()
     before = capture_before(ws, "dashboard", dashboard_id)
 
     if position_json is not None:
         proposed_position = _ensure_json_dict(position_json, "position_json")
+        _validate_position_layout(proposed_position)
+        kwargs["position_json"] = json.dumps(proposed_position)
         proposed_chart_ids = _layout_chart_ids(proposed_position)
 
         existing_layout_ids = _layout_chart_ids(before.get("position_json", {}))
@@ -2147,6 +2239,15 @@ def update_dashboard(
                 "has charts. If this is intentional, re-run with "
                 "allow_empty_layout=True."
             )
+    if json_metadata is not None:
+        proposed_metadata = _ensure_json_dict(json_metadata, "json_metadata")
+        kwargs["json_metadata"] = json.dumps(proposed_metadata)
+
+    if not kwargs:
+        raise ValueError(
+            "Provide at least one field to update "
+            "(dashboard_title, published, position_json, or json_metadata)."
+        )
 
     return _do_mutation(
         tool_name="update_dashboard",
@@ -2247,6 +2348,183 @@ def snapshot_workspace() -> str:
     snap = ws.snapshot()
     _log.info("snapshot counts=%s", snap.counts)
     return json.dumps(snap.model_dump(), indent=2, default=str)
+
+
+# ===================================================================
+# Tools — Local audit visibility + dashboard recovery
+# ===================================================================
+
+
+def _read_mutation_entries(
+    *,
+    limit: int,
+    resource_type: str | None = None,
+    resource_id: int | None = None,
+    tool_name: str | None = None,
+) -> list[dict[str, Any]]:
+    journal = AUDIT_DIR / "mutations.jsonl"
+    if not journal.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for line in journal.read_text().splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if resource_type and entry.get("resource_type") != resource_type:
+            continue
+        if resource_id is not None and _to_int(entry.get("resource_id")) != resource_id:
+            continue
+        if tool_name and entry.get("tool_name") != tool_name:
+            continue
+        entries.append(entry)
+
+    entries.sort(key=lambda item: str(item.get("timestamp", "")), reverse=True)
+    return entries[:limit]
+
+
+@mcp.tool()
+@_handle_errors
+def list_mutations(
+    resource_type: Literal["dashboard", "chart", "dataset"] | None = None,
+    resource_id: int | None = None,
+    tool_name: str | None = None,
+    limit: int = 50,
+) -> str:
+    """List recent local mutation-journal entries for incident debugging."""
+    if limit < 1 or limit > 500:
+        raise ValueError("limit must be between 1 and 500.")
+
+    entries = _read_mutation_entries(
+        limit=limit,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        tool_name=tool_name,
+    )
+    return json.dumps({
+        "count": len(entries),
+        "limit": limit,
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "tool_name": tool_name,
+        "entries": entries,
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def list_dashboard_snapshots(
+    dashboard_id: int | None = None,
+    limit: int = 50,
+) -> str:
+    """List locally saved dashboard snapshots captured before mutations."""
+    if limit < 1 or limit > 500:
+        raise ValueError("limit must be between 1 and 500.")
+
+    snap_dir = AUDIT_DIR / "snapshots"
+    if not snap_dir.exists():
+        return json.dumps({
+            "count": 0,
+            "dashboard_id": dashboard_id,
+            "snapshots": [],
+        }, indent=2, default=str)
+
+    pattern = "dashboard_*.json" if dashboard_id is None else f"dashboard_{dashboard_id}_*.json"
+    files = sorted(
+        snap_dir.glob(pattern),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    records: list[dict[str, Any]] = []
+    for snap in files[:limit]:
+        stem_parts = snap.stem.split("_")
+        snap_dashboard_id = _to_int(stem_parts[1]) if len(stem_parts) >= 3 else None
+        timestamp_token = stem_parts[2] if len(stem_parts) >= 3 else None
+        records.append({
+            "snapshot_path": str(snap),
+            "dashboard_id": snap_dashboard_id,
+            "timestamp_token": timestamp_token,
+            "size_bytes": snap.stat().st_size,
+            "modified_at": datetime.fromtimestamp(
+                snap.stat().st_mtime, tz=timezone.utc
+            ).isoformat(),
+        })
+
+    return json.dumps({
+        "count": len(records),
+        "dashboard_id": dashboard_id,
+        "snapshots": records,
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def restore_dashboard_snapshot(
+    dashboard_id: int,
+    snapshot_path: str,
+    restore_json_metadata: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """Restore dashboard layout/settings from a local snapshot JSON file."""
+    ws = _get_ws()
+    _require_dashboards_exist(ws, [dashboard_id])
+
+    path = Path(snapshot_path).expanduser()
+    if not path.exists():
+        raise ValueError(f"Snapshot not found: {snapshot_path}")
+
+    try:
+        snapshot = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Snapshot file is not valid JSON: {exc}") from exc
+
+    if not isinstance(snapshot, dict):
+        raise ValueError("Snapshot file must contain a JSON object.")
+
+    snap_dashboard_id = _to_int(snapshot.get("id"))
+    if snap_dashboard_id is not None and snap_dashboard_id != dashboard_id:
+        raise ValueError(
+            f"Snapshot dashboard id {snap_dashboard_id} does not match requested "
+            f"dashboard_id {dashboard_id}."
+        )
+
+    restored_position = _ensure_json_dict(snapshot.get("position_json"), "position_json")
+    _validate_position_layout(restored_position)
+    kwargs: dict[str, Any] = {
+        "position_json": json.dumps(restored_position),
+    }
+    if restore_json_metadata:
+        restored_metadata = _ensure_json_dict(snapshot.get("json_metadata"), "json_metadata")
+        kwargs["json_metadata"] = json.dumps(restored_metadata)
+
+    before = capture_before(ws, "dashboard", dashboard_id)
+    return _do_mutation(
+        tool_name="restore_dashboard_snapshot",
+        resource_type="dashboard",
+        action="update",
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        execute=lambda: ws.update_dashboard(dashboard_id, **kwargs),
+        resource_id=dashboard_id,
+        before=before,
+        preview_extras={
+            "snapshot_path": str(path),
+            "restore_json_metadata": restore_json_metadata,
+        },
+        result_extras={
+            "_restored_from_snapshot": str(path),
+        },
+        after_extras={
+            "snapshot_path": str(path),
+            "restore_json_metadata": restore_json_metadata,
+        },
+    )
 
 
 # ===================================================================

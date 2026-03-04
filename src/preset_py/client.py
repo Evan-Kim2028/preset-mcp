@@ -294,6 +294,18 @@ def _metric_to_adhoc(column_name: str) -> dict[str, Any]:
     }
 
 
+def _metric_column_name(metric: dict[str, Any]) -> str | None:
+    """Extract a metric column reference when available."""
+    column = metric.get("column")
+    if isinstance(column, str):
+        return column
+    if isinstance(column, dict):
+        value = column.get("column_name") or column.get("name")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _metric_label(metric: Any) -> str | None:
     """Get a stable label used by Superset for sorting and display."""
     if isinstance(metric, str):
@@ -302,10 +314,17 @@ def _metric_label(metric: Any) -> str | None:
         label = metric.get("label") or metric.get("label_short")
         if label:
             return str(label)
+        metric_name = metric.get("metric_name") or metric.get("name")
+        if isinstance(metric_name, str) and metric_name:
+            return metric_name
         if metric.get("expressionType") == "SQL" and metric.get("sqlExpression"):
             return str(metric["sqlExpression"])
-        if metric.get("column"):
-            return str(metric["column"])
+        column_name = _metric_column_name(metric)
+        aggregate = metric.get("aggregate")
+        if isinstance(aggregate, str) and aggregate and column_name:
+            return f"{aggregate}({column_name})"
+        if column_name:
+            return column_name
     return None
 
 
@@ -334,10 +353,17 @@ def _normalize_orderby(
     orderby: Any,
     metrics: list[Any],
     dataset_columns: set[str] | None = None,
+    *,
+    apply_default: bool = True,
 ) -> list[list[Any]]:
     """Normalize chart orderby values into Superset chart-data shape."""
     dataset_columns = dataset_columns or set()
-    metric_labels = {_metric_label(metric) for metric in metrics if _metric_label(metric)}
+    metric_labels = {
+        label
+        for metric in metrics
+        for label in [_metric_label(metric)]
+        if label
+    }
     normalized: list[list[Any]] = []
     if not isinstance(orderby, list):
         orderby = []
@@ -357,10 +383,72 @@ def _normalize_orderby(
             metric_key = f"SUM({metric_key})"
         if metric_key is not None:
             normalized.append([metric_key, direction])
-    if not normalized and metrics:
-        fallback = _metric_label(metrics[0]) or str(metrics[0])
-        normalized = [[fallback, False]]
+    if apply_default and not normalized and metrics:
+        fallback = _metric_label(metrics[0])
+        if fallback:
+            normalized = [[fallback, False]]
     return normalized
+
+
+def _chart_data_error_message(body: Any) -> str:
+    """Translate chart-data error payloads into actionable messages."""
+    messages: list[str] = []
+    if isinstance(body, dict):
+        message = body.get("message")
+        if isinstance(message, str) and message.strip():
+            messages.append(message.strip())
+        elif message not in (None, ""):
+            messages.append(json.dumps(message, default=str))
+
+        errors = body.get("errors")
+        if isinstance(errors, list):
+            for item in errors:
+                if isinstance(item, dict):
+                    value = item.get("message") or item.get("error") or item.get("detail")
+                    if value:
+                        messages.append(str(value))
+                elif item:
+                    messages.append(str(item))
+
+        for key in ("error", "detail"):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                messages.append(value.strip())
+    elif isinstance(body, list):
+        for item in body:
+            if item:
+                messages.append(str(item))
+    elif body not in (None, ""):
+        messages.append(str(body))
+
+    if not messages:
+        messages = ["Chart-data request failed with an empty API error payload."]
+
+    error_message = " | ".join(dict.fromkeys(messages))
+    lowered = error_message.lower()
+    if "orderby" in lowered and "field may not be null" in lowered:
+        return (
+            "Chart-data validation failed because orderby references an invalid metric key. "
+            "Ensure orderby uses a valid metric label/expression, or remove explicit orderby. "
+            f"Original error: {error_message}"
+        )
+    return error_message
+
+
+def _infer_dataset_time_column(dataset: dict[str, Any]) -> str | None:
+    """Infer a default datetime column when exactly one exists."""
+    raw_columns = dataset.get("columns")
+    if not isinstance(raw_columns, list):
+        return None
+    dttm_columns = [
+        column.get("column_name")
+        for column in raw_columns
+        if isinstance(column, dict) and column.get("is_dttm")
+    ]
+    clean = [value for value in dttm_columns if isinstance(value, str) and value]
+    if len(clean) == 1:
+        return clean[0]
+    return None
 
 
 def _datasource_from_form_data(form_data: dict[str, Any]) -> tuple[int, str]:
@@ -738,6 +826,7 @@ class PresetWorkspace:
                     form_data.get("orderby"),
                     normalized_metrics,
                     dataset_columns,
+                    apply_default=False,
                 ),
                 "is_timeseries": bool(
                     form_data.get("granularity_sqla")
@@ -796,7 +885,7 @@ class PresetWorkspace:
                 "slice_name": sheet_name,
                 "dashboard_id": resolved_dashboard_id,
                 "status": "request_failed",
-                "error": body.get("message", body),
+                "error": _chart_data_error_message(body),
                 "http_status": response.status_code,
                 "payload": payload,
                 "payload_source": payload_source,
@@ -1154,26 +1243,101 @@ class PresetWorkspace:
         row_limit: int = 10000,
         force: bool = False,
     ) -> pd.DataFrame:
-        from datetime import datetime
+        dataset = self._client.get_dataset(dataset_id)
+        dataset_columns = _dataset_column_names(dataset)
+        dataset_metrics = _dataset_metric_names(dataset)
+        normalized_metrics = _normalize_metrics(metrics, dataset_columns, dataset_metrics)
+        normalized_columns = [str(col) for col in (columns or []) if col not in (None, "")]
 
-        start_dt = datetime.fromisoformat(start) if start else None
-        end_dt = datetime.fromisoformat(end) if end else None
-        return self._client.get_data(
-            dataset_id=dataset_id,
-            metrics=metrics,
-            columns=columns or [],
-            order_by=order_by,
-            order_desc=order_desc,
-            is_timeseries=is_timeseries,
-            time_column=time_column,
-            start=start_dt,
-            end=end_dt,
-            granularity=granularity,
-            where=where,
-            having=having,
-            row_limit=row_limit,
-            force=force,
-        )
+        if not normalized_metrics:
+            raise ValueError("metrics must contain at least one metric.")
+
+        if is_timeseries:
+            resolved_time_column = time_column or _infer_dataset_time_column(dataset)
+            if not resolved_time_column:
+                raise ValueError(
+                    "Unable to determine time column for time-series query. "
+                    "Pass time_column explicitly or ensure the dataset has a single "
+                    "datetime column."
+                )
+        else:
+            resolved_time_column = None
+
+        time_range = "No filter"
+        if start or end:
+            time_range = f"{start or ''} : {end or ''}"
+
+        query: dict[str, Any] = {
+            "annotation_layers": [],
+            "applied_time_extras": {},
+            "columns": list(dict.fromkeys(normalized_columns)),
+            "custom_form_data": {},
+            "custom_params": {},
+            "extras": {
+                "having": having,
+                "having_druid": [],
+                "where": where,
+            },
+            "filters": [],
+            "is_timeseries": bool(is_timeseries),
+            "metrics": normalized_metrics,
+            "order_desc": order_desc,
+            "orderby": _normalize_orderby(
+                order_by or [],
+                normalized_metrics,
+                dataset_columns,
+                apply_default=False,
+            ),
+            "row_limit": row_limit,
+            "time_range": time_range,
+            "timeseries_limit": 0,
+            "url_params": {},
+        }
+        if resolved_time_column:
+            query["granularity"] = resolved_time_column
+            if granularity:
+                query["extras"]["time_grain_sqla"] = granularity
+
+        payload: dict[str, Any] = {
+            "datasource": {"id": dataset_id, "type": "table"},
+            "force": force,
+            "queries": [query],
+            "result_format": "json",
+            "result_type": "full",
+        }
+        endpoint = str(self._client.baseurl / "api/v1" / "chart" / "data")
+        response = self._client.session.post(endpoint, json=payload)
+
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise ValueError(
+                "query_dataset received a non-JSON response from chart-data endpoint."
+            ) from exc
+
+        if response.status_code != 200:
+            raise ValueError(_chart_data_error_message(body))
+
+        results = body.get("result")
+        if not isinstance(results, list) or not results:
+            raise ValueError("query_dataset received malformed chart-data response.")
+
+        first = results[0]
+        if not isinstance(first, dict):
+            raise ValueError("query_dataset received malformed chart-data result entry.")
+
+        status = first.get("status")
+        error = first.get("error")
+        if status not in (None, "success") or error:
+            detail = error or f"status={status!r}"
+            raise ValueError(f"query_dataset failed: {detail}")
+
+        rows = first.get("data")
+        if isinstance(rows, list):
+            return pd.DataFrame(rows)
+        if isinstance(rows, dict):
+            return pd.DataFrame([rows])
+        return pd.DataFrame()
 
     # ------------------------------------------------------------------
     # Create helpers
