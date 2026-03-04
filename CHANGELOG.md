@@ -26,6 +26,11 @@
   - `restore_dashboard_snapshot`
 - `verify_chart_workflow` tool for one-shot end-to-end chart/dashboard
   verification (query + optional render checks).
+- Golden-template and structure-verification tools:
+  - `verify_dashboard_structure`
+  - `verify_dashboard_workflow`
+  - `capture_dashboard_template`
+  - `capture_golden_templates`
 
 ### Improved
 - `create_chart` now supports `template` mode (`auto` or `minimal`).
@@ -34,6 +39,9 @@
 - Viz-aware params validation now enforces required fields for common chart
   types (`pie`, timeseries ECharts, `big_number_total`), reducing incomplete
   chart configs that pass mutation but fail at render time.
+- Added portable template sanitization and dashboard-graph integrity analysis
+  to improve reuse of proven dashboard patterns (for example BTC Fight,
+  Walrus, DeepBook-style templates).
 
 ### Quality
 - Added regression tests covering:

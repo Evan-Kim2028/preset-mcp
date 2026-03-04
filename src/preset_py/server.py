@@ -26,6 +26,7 @@ import functools
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -685,6 +686,317 @@ def _validate_position_layout(position_json: dict[str, Any]) -> None:
             raise ValueError(
                 f"position_json[{node_id!r}].parents must be a list when provided."
             )
+
+
+_TEMPLATE_DROP_COMMON_KEYS = frozenset({
+    "slice_id",
+    "slice_name",
+    "cache_key",
+    "cache_timeout",
+    "changed_on",
+    "changed_on_delta_humanized",
+    "owners",
+    "last_saved_at",
+    "last_saved_by",
+})
+
+_TEMPLATE_DROP_PORTABLE_KEYS = frozenset({
+    "datasource",
+    "datasource_id",
+    "datasource_type",
+    "database_id",
+    "dashboards",
+    "uuid",
+    "id",
+})
+
+
+def _slugify(value: str) -> str:
+    text = value.strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = text.strip("-")
+    return text or "dashboard"
+
+
+def _parse_json_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _sanitize_template_payload(
+    value: Any,
+    *,
+    portable: bool,
+) -> Any:
+    """Normalize template payloads by dropping volatile runtime keys."""
+    drop_keys = set(_TEMPLATE_DROP_COMMON_KEYS)
+    if portable:
+        drop_keys.update(_TEMPLATE_DROP_PORTABLE_KEYS)
+
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in drop_keys:
+                continue
+            cleaned[key] = _sanitize_template_payload(item, portable=portable)
+        return cleaned
+    if isinstance(value, list):
+        return [_sanitize_template_payload(item, portable=portable) for item in value]
+    return value
+
+
+def _dashboard_structure_report(
+    position_json: Any,
+    json_metadata: Any,
+    dashboard_charts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Analyze dashboard layout graph and chart reference integrity."""
+    position = _ensure_json_dict(position_json, "position_json")
+    metadata = _ensure_json_dict(json_metadata, "json_metadata")
+    nodes = {
+        str(node_id): node
+        for node_id, node in position.items()
+        if isinstance(node, dict)
+    }
+
+    missing_required_nodes = [
+        node_id for node_id in ("ROOT_ID", "GRID_ID")
+        if node_id not in nodes
+    ]
+    invalid_children_nodes: list[str] = []
+    invalid_parent_nodes: list[str] = []
+    dangling_children: list[dict[str, str]] = []
+    parent_mismatches: list[dict[str, Any]] = []
+
+    for node_id, node in nodes.items():
+        children = node.get("children")
+        if children is None:
+            children = []
+        if not isinstance(children, list):
+            invalid_children_nodes.append(node_id)
+            children = []
+        for child in children:
+            child_id = str(child)
+            if child_id not in nodes:
+                dangling_children.append({
+                    "parent_node": node_id,
+                    "child_node": child_id,
+                })
+                continue
+            child_parents = nodes[child_id].get("parents")
+            if child_parents is not None and not isinstance(child_parents, list):
+                invalid_parent_nodes.append(child_id)
+                continue
+            if isinstance(child_parents, list):
+                normalized_parents = {str(item) for item in child_parents}
+                if node_id not in normalized_parents:
+                    parent_mismatches.append({
+                        "parent_node": node_id,
+                        "child_node": child_id,
+                        "child_parents": sorted(normalized_parents),
+                    })
+
+    reachable: set[str] = set()
+    queue: list[str] = ["ROOT_ID"] if "ROOT_ID" in nodes else []
+    while queue:
+        current = queue.pop(0)
+        if current in reachable:
+            continue
+        reachable.add(current)
+        children = nodes.get(current, {}).get("children")
+        if not isinstance(children, list):
+            continue
+        for child in children:
+            child_id = str(child)
+            if child_id in nodes and child_id not in reachable:
+                queue.append(child_id)
+
+    unreachable_nodes = sorted(
+        node_id for node_id in nodes.keys()
+        if node_id not in reachable
+    )
+
+    attached_chart_ids = {
+        cid
+        for cid in (_to_int(chart.get("id")) for chart in dashboard_charts)
+        if cid is not None
+    }
+    layout_chart_ids = set(_extract_position_chart_refs(position).values())
+    scope_chart_ids = _extract_scope_chart_refs(metadata)
+
+    layout_orphans = sorted(layout_chart_ids - attached_chart_ids)
+    scope_orphans = sorted(scope_chart_ids - attached_chart_ids)
+    attached_missing_layout = sorted(attached_chart_ids - layout_chart_ids)
+
+    status = "success"
+    if missing_required_nodes or invalid_children_nodes or dangling_children:
+        status = "failed"
+    elif (
+        invalid_parent_nodes
+        or parent_mismatches
+        or unreachable_nodes
+        or layout_orphans
+        or scope_orphans
+        or attached_missing_layout
+    ):
+        status = "warning"
+
+    return {
+        "status": status,
+        "node_count": len(nodes),
+        "chart_count_attached": len(attached_chart_ids),
+        "missing_required_nodes": missing_required_nodes,
+        "invalid_children_nodes": sorted(set(invalid_children_nodes)),
+        "invalid_parent_nodes": sorted(set(invalid_parent_nodes)),
+        "dangling_children": dangling_children,
+        "parent_mismatches": parent_mismatches,
+        "unreachable_nodes": unreachable_nodes,
+        "layout_chart_ids": sorted(layout_chart_ids),
+        "scope_chart_ids": sorted(scope_chart_ids),
+        "layout_orphans": layout_orphans,
+        "scope_orphans": scope_orphans,
+        "attached_missing_layout": attached_missing_layout,
+    }
+
+
+def _template_chart_specs(
+    ws: PresetWorkspace,
+    dashboard_charts: list[dict[str, Any]],
+    *,
+    portable: bool,
+    include_query_context: bool,
+    include_dataset_schema: bool,
+) -> list[dict[str, Any]]:
+    """Build reusable chart specs from a dashboard's chart definitions."""
+    specs: list[dict[str, Any]] = []
+    chart_detail_cache: dict[int, dict[str, Any]] = {}
+    dataset_cache: dict[int, dict[str, Any]] = {}
+
+    for chart in dashboard_charts:
+        chart_id = _to_int(chart.get("id"))
+        if chart_id is None:
+            continue
+
+        detail: dict[str, Any] | None = None
+        if include_query_context or not isinstance(chart.get("form_data"), dict):
+            try:
+                detail = ws.chart_detail(chart_id)
+            except Exception:
+                detail = None
+            if isinstance(detail, dict):
+                chart_detail_cache[chart_id] = detail
+        else:
+            detail = chart_detail_cache.get(chart_id)
+
+        viz_type = chart.get("viz_type")
+        if not isinstance(viz_type, str) or not viz_type:
+            if isinstance(detail, dict):
+                raw_viz = detail.get("viz_type")
+                if isinstance(raw_viz, str):
+                    viz_type = raw_viz
+
+        form_data = chart.get("form_data")
+        if not isinstance(form_data, dict):
+            if isinstance(detail, dict):
+                form_data = _parse_json_object(detail.get("params"))
+            if not isinstance(form_data, dict):
+                form_data = {}
+
+        datasource_id = _to_int(chart.get("datasource_id"))
+        datasource_type = chart.get("datasource_type")
+        if datasource_id is None or not isinstance(datasource_type, str):
+            ds_from_form = form_data.get("datasource")
+            if isinstance(ds_from_form, str) and "__" in ds_from_form:
+                raw_id, raw_type = ds_from_form.split("__", 1)
+                datasource_id = datasource_id or _to_int(raw_id)
+                if not isinstance(datasource_type, str) or not datasource_type:
+                    datasource_type = raw_type
+
+        spec: dict[str, Any] = {
+            "chart_id": chart_id,
+            "title": chart.get("slice_name") or chart.get("chart_name"),
+            "viz_type": viz_type,
+            "datasource_id": datasource_id,
+            "datasource_type": datasource_type,
+            "form_data": _sanitize_template_payload(form_data, portable=portable),
+        }
+
+        if include_query_context:
+            qc = _parse_json_object((detail or {}).get("query_context"))
+            spec["query_context"] = _sanitize_template_payload(qc or {}, portable=portable)
+
+        if include_dataset_schema and datasource_id is not None:
+            dataset = dataset_cache.get(datasource_id)
+            if dataset is None:
+                try:
+                    dataset = ws.dataset_detail(datasource_id)
+                except Exception:
+                    dataset = {}
+                dataset_cache[datasource_id] = dataset
+            if isinstance(dataset, dict):
+                spec["dataset_schema"] = {
+                    "table_name": dataset.get("table_name"),
+                    "schema": dataset.get("schema"),
+                    "columns": sorted(_dataset_columns(dataset)),
+                    "metrics": sorted(_dataset_metrics(dataset)),
+                }
+
+        specs.append(spec)
+
+    return specs
+
+
+def _build_dashboard_template_payload(
+    ws: PresetWorkspace,
+    dashboard_id: int,
+    *,
+    portable: bool,
+    include_query_context: bool,
+    include_dataset_schema: bool,
+) -> dict[str, Any]:
+    dashboard = ws.dashboard_detail(dashboard_id)
+    dashboard_charts = ws.dashboard_charts(dashboard_id)
+    structure = _dashboard_structure_report(
+        dashboard.get("position_json", {}),
+        dashboard.get("json_metadata", {}),
+        dashboard_charts,
+    )
+
+    return {
+        "template_version": "v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "portable": portable,
+        "dashboard": {
+            "id": _to_int(dashboard.get("id")) or dashboard_id,
+            "title": dashboard.get("dashboard_title"),
+            "slug": dashboard.get("slug"),
+            "position_json": _sanitize_template_payload(
+                _ensure_json_dict(dashboard.get("position_json", {}), "position_json"),
+                portable=portable,
+            ),
+            "json_metadata": _sanitize_template_payload(
+                _ensure_json_dict(dashboard.get("json_metadata", {}), "json_metadata"),
+                portable=portable,
+            ),
+            "structure_report": structure,
+        },
+        "charts": _template_chart_specs(
+            ws,
+            dashboard_charts,
+            portable=portable,
+            include_query_context=include_query_context,
+            include_dataset_schema=include_dataset_schema,
+        ),
+    }
 
 
 def _chart_title(entry: dict[str, Any]) -> str | None:
@@ -1868,6 +2180,293 @@ def verify_chart_workflow(
         }, indent=2, default=str)
 
     return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def verify_dashboard_structure(
+    dashboard_id: int,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Validate dashboard layout graph integrity and chart reference health."""
+    ws = _get_ws()
+    dashboard = ws.dashboard_detail(dashboard_id)
+    charts = ws.dashboard_charts(dashboard_id)
+    report = _dashboard_structure_report(
+        dashboard.get("position_json", {}),
+        dashboard.get("json_metadata", {}),
+        charts,
+    )
+
+    if response_mode == "compact":
+        return json.dumps({
+            "dashboard_id": dashboard_id,
+            "status": report.get("status"),
+            "node_count": report.get("node_count"),
+            "chart_count_attached": report.get("chart_count_attached"),
+            "layout_orphan_count": len(report.get("layout_orphans", [])),
+            "scope_orphan_count": len(report.get("scope_orphans", [])),
+            "dangling_child_count": len(report.get("dangling_children", [])),
+        }, indent=2, default=str)
+
+    if response_mode == "standard":
+        return json.dumps({
+            "dashboard_id": dashboard_id,
+            "status": report.get("status"),
+            "node_count": report.get("node_count"),
+            "chart_count_attached": report.get("chart_count_attached"),
+            "missing_required_nodes": report.get("missing_required_nodes"),
+            "dangling_children": report.get("dangling_children"),
+            "layout_orphans": report.get("layout_orphans"),
+            "scope_orphans": report.get("scope_orphans"),
+            "attached_missing_layout": report.get("attached_missing_layout"),
+        }, indent=2, default=str)
+
+    return json.dumps({
+        "dashboard_id": dashboard_id,
+        "dashboard_title": dashboard.get("dashboard_title"),
+        "structure_report": report,
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def verify_dashboard_workflow(
+    dashboard_id: int,
+    include_render: bool = True,
+    row_limit: int = 10000,
+    force: bool = False,
+    timeout_ms: int = 45000,
+    settle_ms: int = 2500,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Run structure + query + optional render verification for a dashboard."""
+    ws = _get_ws()
+    dashboard = ws.dashboard_detail(dashboard_id)
+    charts = ws.dashboard_charts(dashboard_id)
+    structure = _dashboard_structure_report(
+        dashboard.get("position_json", {}),
+        dashboard.get("json_metadata", {}),
+        charts,
+    )
+    query_result = ws.validate_dashboard_charts(
+        dashboard_id,
+        row_limit=row_limit,
+        force=force,
+    )
+    render_result = (
+        ws.validate_dashboard_render(
+            dashboard_id,
+            timeout_ms=timeout_ms,
+            settle_ms=settle_ms,
+        )
+        if include_render
+        else None
+    )
+
+    query_failures = len([
+        item for item in query_result.get("results", [])
+        if isinstance(item, dict) and item.get("status") != "success"
+    ])
+    render_broken = int((render_result or {}).get("broken_count") or 0)
+
+    status = "success"
+    if structure.get("status") == "failed":
+        status = "failed"
+    elif structure.get("status") == "warning":
+        status = "warning"
+    if query_failures > 0:
+        status = "failed"
+    if include_render and render_broken > 0:
+        status = "failed"
+
+    if response_mode == "compact":
+        return json.dumps({
+            "dashboard_id": dashboard_id,
+            "status": status,
+            "structure_status": structure.get("status"),
+            "query_failures": query_failures,
+            "render_broken_count": render_broken if include_render else None,
+        }, indent=2, default=str)
+
+    if response_mode == "standard":
+        return json.dumps({
+            "dashboard_id": dashboard_id,
+            "dashboard_title": dashboard.get("dashboard_title"),
+            "status": status,
+            "structure": {
+                "status": structure.get("status"),
+                "missing_required_nodes": structure.get("missing_required_nodes"),
+                "layout_orphans": structure.get("layout_orphans"),
+                "scope_orphans": structure.get("scope_orphans"),
+            },
+            "query_validation": {
+                "chart_count": query_result.get("chart_count"),
+                "validated": query_result.get("validated"),
+                "failed_count": query_failures,
+            },
+            "render_validation": (
+                {
+                    "chart_count": render_result.get("chart_count"),
+                    "broken_count": render_broken,
+                }
+                if include_render and isinstance(render_result, dict)
+                else None
+            ),
+        }, indent=2, default=str)
+
+    return json.dumps({
+        "dashboard_id": dashboard_id,
+        "dashboard_title": dashboard.get("dashboard_title"),
+        "status": status,
+        "structure_report": structure,
+        "query_validation": query_result,
+        "render_validation": render_result,
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def capture_dashboard_template(
+    dashboard_id: int,
+    portable: bool = True,
+    include_query_context: bool = False,
+    include_dataset_schema: bool = False,
+    output_path: str | None = None,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Capture a reusable dashboard+chart template from an existing dashboard."""
+    ws = _get_ws()
+    template = _build_dashboard_template_payload(
+        ws,
+        dashboard_id,
+        portable=portable,
+        include_query_context=include_query_context,
+        include_dataset_schema=include_dataset_schema,
+    )
+
+    resolved_output: str | None = None
+    if output_path:
+        path = Path(output_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(template, indent=2, default=str) + "\n")
+        resolved_output = str(path)
+
+    chart_count = len(template.get("charts", []))
+    structure = template.get("dashboard", {}).get("structure_report", {})
+
+    if response_mode == "compact":
+        return json.dumps({
+            "dashboard_id": dashboard_id,
+            "title": template.get("dashboard", {}).get("title"),
+            "chart_count": chart_count,
+            "structure_status": structure.get("status"),
+            "output_path": resolved_output,
+        }, indent=2, default=str)
+
+    if response_mode == "standard":
+        return json.dumps({
+            "dashboard_id": dashboard_id,
+            "title": template.get("dashboard", {}).get("title"),
+            "chart_count": chart_count,
+            "structure_status": structure.get("status"),
+            "structure_summary": {
+                "layout_orphans": structure.get("layout_orphans"),
+                "scope_orphans": structure.get("scope_orphans"),
+                "dangling_children": structure.get("dangling_children"),
+            },
+            "example_charts": template.get("charts", [])[:3],
+            "output_path": resolved_output,
+            "hint": "Use response_mode='full' to get the full template JSON inline.",
+        }, indent=2, default=str)
+
+    payload = dict(template)
+    if resolved_output:
+        payload["_saved_to"] = resolved_output
+    return json.dumps(payload, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def capture_golden_templates(
+    dashboard_ids: list[int] | str,
+    output_dir: str = "~/.preset-mcp/golden-templates",
+    portable: bool = True,
+    include_query_context: bool = False,
+    include_dataset_schema: bool = False,
+    overwrite: bool = False,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Capture templates from one or more dashboards into a local folder."""
+    ws = _get_ws()
+    ids = _coerce_list_arg(
+        dashboard_ids,
+        field_name="dashboard_ids",
+        item_kind="int",
+    )
+    if not ids:
+        raise ValueError("dashboard_ids must include at least one dashboard ID.")
+
+    target_dir = Path(output_dir).expanduser()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for dashboard_id in ids:
+        try:
+            template = _build_dashboard_template_payload(
+                ws,
+                dashboard_id,
+                portable=portable,
+                include_query_context=include_query_context,
+                include_dataset_schema=include_dataset_schema,
+            )
+            title = str(template.get("dashboard", {}).get("title") or f"dashboard-{dashboard_id}")
+            filename = f"{dashboard_id}_{_slugify(title)}.json"
+            path = target_dir / filename
+            if path.exists() and not overwrite:
+                failures.append({
+                    "dashboard_id": dashboard_id,
+                    "error": f"{path} already exists. Re-run with overwrite=True.",
+                })
+                continue
+            path.write_text(json.dumps(template, indent=2, default=str) + "\n")
+            saved.append({
+                "dashboard_id": dashboard_id,
+                "title": title,
+                "chart_count": len(template.get("charts", [])),
+                "structure_status": template.get("dashboard", {}).get("structure_report", {}).get("status"),
+                "output_path": str(path),
+            })
+        except Exception as exc:
+            failures.append({
+                "dashboard_id": dashboard_id,
+                "error": str(exc),
+            })
+
+    status = "success" if not failures else ("partial_success" if saved else "failed")
+    payload = {
+        "status": status,
+        "output_dir": str(target_dir),
+        "requested_count": len(ids),
+        "saved_count": len(saved),
+        "failed_count": len(failures),
+        "saved": saved,
+        "failures": failures,
+    }
+
+    if response_mode == "compact":
+        return json.dumps({
+            "status": status,
+            "output_dir": str(target_dir),
+            "saved_count": len(saved),
+            "failed_count": len(failures),
+        }, indent=2, default=str)
+
+    if response_mode == "standard":
+        return json.dumps(payload, indent=2, default=str)
+
+    return json.dumps(payload, indent=2, default=str)
 
 
 # ===================================================================

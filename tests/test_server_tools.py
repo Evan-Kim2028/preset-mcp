@@ -517,3 +517,163 @@ def test_verify_chart_workflow_compact(monkeypatch) -> None:
     payload = json.loads(raw)
     assert payload["status"] == "success"
     assert payload["dashboard_render_broken_count"] == 0
+
+
+def test_verify_dashboard_structure_detects_layout_issues(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "dashboard_title": "Deepbook",
+                "position_json": {
+                    "ROOT_ID": {"children": ["GRID_ID"]},
+                    "GRID_ID": {"children": ["CHART-1", "ROW-404"]},
+                    "CHART-1": {"children": [], "meta": {"chartId": 101}},
+                },
+                "json_metadata": {"chartsInScope": {"101": {}, "999": {}}},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return [{"id": 101, "slice_name": "Volume"}]
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.verify_dashboard_structure.fn(
+        dashboard_id=80,
+        response_mode="standard",
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "failed"
+    assert payload["dangling_children"]
+    assert payload["scope_orphans"] == [999]
+
+
+def test_verify_dashboard_workflow_reports_failed_query(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "dashboard_title": "BTC Fight",
+                "position_json": {
+                    "ROOT_ID": {"children": ["GRID_ID"]},
+                    "GRID_ID": {"children": ["CHART-1"]},
+                    "CHART-1": {"children": [], "meta": {"chartId": 1}},
+                },
+                "json_metadata": {"chartsInScope": {"1": {}}},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return [{"id": 1, "slice_name": "Chart 1"}]
+
+        def validate_dashboard_charts(self, dashboard_id: int, row_limit=10000, force=False):
+            return {
+                "dashboard_id": dashboard_id,
+                "chart_count": 1,
+                "validated": 1,
+                "results": [{"chart_id": 1, "status": "failed"}],
+            }
+
+        def validate_dashboard_render(self, dashboard_id: int, **kwargs):
+            return {"dashboard_id": dashboard_id, "chart_count": 1, "broken_count": 0}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.verify_dashboard_workflow.fn(
+        dashboard_id=80,
+        include_render=True,
+        response_mode="compact",
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "failed"
+    assert payload["query_failures"] == 1
+
+
+def test_capture_dashboard_template_writes_file(monkeypatch, tmp_path) -> None:
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "dashboard_title": "Walrus",
+                "slug": "walrus",
+                "position_json": {
+                    "ROOT_ID": {"children": ["GRID_ID"]},
+                    "GRID_ID": {"children": ["CHART-1"]},
+                    "CHART-1": {"children": [], "meta": {"chartId": 1}},
+                },
+                "json_metadata": {"chartsInScope": {"1": {}}},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return [
+                {
+                    "id": 1,
+                    "slice_name": "Walrus Volume",
+                    "viz_type": "pie",
+                    "datasource_id": 100,
+                    "datasource_type": "table",
+                    "form_data": {
+                        "datasource": "100__table",
+                        "metrics": ["count"],
+                        "groupby": ["CHAIN"],
+                    },
+                }
+            ]
+
+        def chart_detail(self, chart_id: int):
+            return {
+                "id": chart_id,
+                "query_context": '{"datasource":{"id":100,"type":"table"},"queries":[]}',
+            }
+
+        def dataset_detail(self, dataset_id: int):
+            return {
+                "id": dataset_id,
+                "table_name": "walrus_metrics",
+                "schema": "public",
+                "columns": [{"column_name": "CHAIN"}],
+                "metrics": [{"metric_name": "count"}],
+            }
+
+    output_path = tmp_path / "walrus_template.json"
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.capture_dashboard_template.fn(
+        dashboard_id=80,
+        portable=True,
+        include_query_context=True,
+        include_dataset_schema=True,
+        output_path=str(output_path),
+        response_mode="compact",
+    )
+    payload = json.loads(raw)
+    assert payload["chart_count"] == 1
+    assert payload["output_path"] == str(output_path)
+    saved = json.loads(output_path.read_text())
+    assert saved["dashboard"]["title"] == "Walrus"
+    assert saved["charts"][0]["dataset_schema"]["columns"] == ["CHAIN"]
+    assert "datasource" not in saved["charts"][0]["form_data"]
+
+
+def test_capture_golden_templates_batch(monkeypatch, tmp_path) -> None:
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "dashboard_title": f"Dashboard {dashboard_id}",
+                "position_json": {
+                    "ROOT_ID": {"children": ["GRID_ID"]},
+                    "GRID_ID": {"children": []},
+                },
+                "json_metadata": {"chartsInScope": {}},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return []
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.capture_golden_templates.fn(
+        dashboard_ids="[80,81]",
+        output_dir=str(tmp_path),
+        overwrite=True,
+        response_mode="compact",
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "success"
+    assert payload["saved_count"] == 2
