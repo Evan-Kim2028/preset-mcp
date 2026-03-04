@@ -1814,7 +1814,8 @@ def query_dataset(
     order_by_list = _coerce_list_arg(
         order_by, field_name="order_by", item_kind="str"
     )
-    is_timeseries = bool(time_column and granularity)
+    # A query is timeseries whenever a time column is provided; granularity is optional.
+    is_timeseries = bool(time_column)
     df = ws.query_dataset(
         dataset_id=dataset_id,
         metrics=metrics_list,

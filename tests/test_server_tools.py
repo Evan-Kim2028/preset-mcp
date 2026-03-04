@@ -1,5 +1,6 @@
 import json
 
+import pandas as pd
 import pytest
 from fastmcp.exceptions import ToolError
 
@@ -38,6 +39,34 @@ def test_create_dataset_checks_database_precondition(monkeypatch) -> None:
         )
     payload = _validation_payload(exc.value)
     assert "Database 999 not found" in payload["error"]
+
+
+def test_query_dataset_treats_time_column_as_timeseries(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        def query_dataset(self, **kwargs):
+            self.kwargs = kwargs
+            return pd.DataFrame([{"day": "2026-01-01", "count": 1}])
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+
+    raw = server.query_dataset.fn(
+        dataset_id=814,
+        metrics='["count"]',
+        time_column="day",
+        start="2026-01-01",
+        end="2026-01-31",
+        response_mode="compact",
+    )
+    payload = json.loads(raw)
+
+    assert payload["rowcount"] == 1
+    assert ws.kwargs is not None
+    assert ws.kwargs["is_timeseries"] is True
+    assert ws.kwargs["time_column"] == "day"
 
 
 def test_create_chart_accepts_json_array_strings_and_validates(monkeypatch) -> None:
