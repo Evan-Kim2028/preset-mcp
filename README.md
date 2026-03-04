@@ -277,6 +277,24 @@ capture_golden_templates(
 )
 ```
 
+CLI alternative:
+
+```bash
+uv run scripts/export_golden_templates.py \
+  --workspace "Mysten Labs--General" \
+  --dashboard-ids 80,103,102 \
+  --output-dir ~/.preset-mcp/golden-templates \
+  --overwrite
+```
+
+Optional live smoke test (skipped by default):
+
+```bash
+PRESET_MCP_ENABLE_LIVE_TESTS=1 \
+PRESET_MCP_LIVE_DASHBOARD_IDS=80,103,102 \
+uv run --with pytest pytest -q tests/test_live_dashboard_smoke.py
+```
+
 ## License
 
 MIT

@@ -31,6 +31,8 @@
   - `verify_dashboard_workflow`
   - `capture_dashboard_template`
   - `capture_golden_templates`
+- Added `scripts/export_golden_templates.py` for repeatable live template
+  harvesting from known dashboards.
 
 ### Improved
 - `create_chart` now supports `template` mode (`auto` or `minimal`).
@@ -42,6 +44,8 @@
 - Added portable template sanitization and dashboard-graph integrity analysis
   to improve reuse of proven dashboard patterns (for example BTC Fight,
   Walrus, DeepBook-style templates).
+- Added opt-in live smoke test (`tests/test_live_dashboard_smoke.py`) for
+  real dashboard verification + template export.
 
 ### Quality
 - Added regression tests covering:
