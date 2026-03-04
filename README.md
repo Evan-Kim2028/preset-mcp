@@ -244,6 +244,13 @@ Notes:
 - `create_chart.template="auto"` applies viz-specific defaults for missing fields.
 - `params_json` is validated preflight against dataset columns/metrics.
 - `params_json` cannot include datasource-rebinding keys like `viz_type` or `datasource_id`.
+- `create_chart.repair_dashboard_refs` defaults to `false` so chart creation does not mutate dashboard layouts unless explicitly requested.
+
+## Strict Params Semantics
+
+- `update_chart(params_json=...)` uses strict validation semantics and treats `params_json` as a full viz-compatible params payload.
+- For viz types with required fields (for example `pie` and timeseries charts), partial payloads like only `{"color_scheme":"..."}` are rejected.
+- Use `get_chart(chart_id=<id>, response_mode="full")` to copy/edit the existing params JSON when you need precise updates.
 
 ## Golden Template Workflow
 

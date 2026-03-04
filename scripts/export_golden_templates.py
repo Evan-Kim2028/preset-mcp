@@ -46,9 +46,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--portable",
+        dest="portable",
         action="store_true",
         default=True,
         help="Strip datasource/runtime-specific keys for portability (default: true).",
+    )
+    parser.add_argument(
+        "--no-portable",
+        dest="portable",
+        action="store_false",
+        help="Keep datasource/runtime-specific keys in exported templates.",
     )
     parser.add_argument(
         "--include-query-context",
@@ -58,9 +65,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--include-dataset-schema",
+        dest="include_dataset_schema",
         action="store_true",
         default=True,
         help="Include dataset column/metric names in template specs (default: true).",
+    )
+    parser.add_argument(
+        "--no-include-dataset-schema",
+        dest="include_dataset_schema",
+        action="store_false",
+        help="Do not include dataset column/metric names in template specs.",
     )
     parser.add_argument(
         "--overwrite",

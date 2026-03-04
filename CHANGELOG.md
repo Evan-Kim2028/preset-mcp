@@ -18,6 +18,8 @@
 - Added duplicate-label linting in params validation:
   - duplicate dimension labels across fields (for example `x_axis` + `groupby`)
   - metric/dimension label collisions.
+- `create_chart.repair_dashboard_refs` now defaults to `False` so chart
+  creation does not silently mutate dashboard layout metadata.
 
 ### Added
 - Local audit/recovery MCP tools:
@@ -41,6 +43,9 @@
 - Viz-aware params validation now enforces required fields for common chart
   types (`pie`, timeseries ECharts, `big_number_total`), reducing incomplete
   chart configs that pass mutation but fail at render time.
+- `update_chart(params_json=...)` now documents and enforces strict semantics:
+  payloads are treated as full params objects (not partial patches), with
+  explicit guidance in validation errors.
 - Added portable template sanitization and dashboard-graph integrity analysis
   to improve reuse of proven dashboard patterns (for example BTC Fight,
   Walrus, DeepBook-style templates).

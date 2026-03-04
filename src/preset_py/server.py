@@ -2562,7 +2562,7 @@ def create_chart(
     params_json: str | None = None,
     dashboards: list[int] | str | None = None,
     validate_after_create: bool = True,
-    repair_dashboard_refs: bool = True,
+    repair_dashboard_refs: bool = False,
     dry_run: bool = False,
 ) -> str:
     """Create a chart from an existing dataset.
@@ -2585,7 +2585,10 @@ def create_chart(
         dashboards: Dashboard IDs to attach this chart to
         validate_after_create: Run chart-data validation after create
         repair_dashboard_refs: Attempt to repair stale dashboard chart
-                               references when dashboards are provided
+                               references when dashboards are provided.
+                               Defaults to False so create_chart does not
+                               mutate dashboard layouts unless explicitly
+                               requested.
         dry_run: If True, validate inputs and return a preview without
                  making any changes (default: False)
     """
@@ -2833,12 +2836,19 @@ def update_chart(
     string to override visualization parameters (metrics, groupby,
     filters, etc.).
 
+    params_json uses strict semantics: when provided, it is treated as a
+    full chart params payload for validation. For viz types with required
+    fields (for example pie/timeseries), include those fields in the
+    payload instead of sending partial patches.
+
     Args:
         chart_id: ID of the chart to update
         title: New chart title
         viz_type: New visualization type
         params_json: JSON string of chart parameters (advanced — use
-                     get_chart to inspect existing chart params first)
+                     get_chart to inspect existing chart params first).
+                     Strict semantics: provide a complete params payload
+                     compatible with the chart viz type.
         dashboards: Reassign chart to these dashboard IDs
         validate_after_update: Run chart-data validation after update
         dry_run: If True, validate inputs, capture current state, and
@@ -2880,12 +2890,18 @@ def update_chart(
             except Exception:
                 dataset_columns = set()
                 dataset_metrics = set()
-        _, params_warnings = validate_params_payload(
-            params_json,
-            dataset_columns=dataset_columns,
-            dataset_metrics=dataset_metrics,
-            viz_type=resolved_viz_type,
-        )
+        try:
+            _, params_warnings = validate_params_payload(
+                params_json,
+                dataset_columns=dataset_columns,
+                dataset_metrics=dataset_metrics,
+                viz_type=resolved_viz_type,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{exc} Strict params semantics: update_chart.params_json must "
+                "be a complete viz-compatible params payload, not a partial patch."
+            ) from exc
 
     kwargs: dict[str, Any] = {}
     if title is not None:

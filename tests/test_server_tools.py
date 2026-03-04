@@ -195,6 +195,52 @@ def test_create_chart_rejects_invalid_dashboard_id(monkeypatch) -> None:
     assert "Dashboard 123 not found" in payload["error"]
 
 
+def test_create_chart_default_does_not_repair_dashboard_refs(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def __init__(self) -> None:
+            self.dashboard_detail_calls = 0
+            self.updated_dashboard = False
+
+        def dataset_detail(self, dataset_id: int):
+            return {
+                "id": dataset_id,
+                "columns": [{"column_name": "CHAIN"}],
+                "metrics": [{"metric_name": "count"}],
+            }
+
+        def dashboard_detail(self, dashboard_id: int):
+            self.dashboard_detail_calls += 1
+            return {
+                "id": dashboard_id,
+                "position_json": {"ROOT_ID": {"children": ["GRID_ID"]}, "GRID_ID": {"children": []}},
+                "json_metadata": {"chartsInScope": {}},
+            }
+
+        def create_chart(self, dataset_id: int, title: str, viz_type: str, **kwargs):
+            return {"id": 77, "slice_name": title, "viz_type": viz_type, **kwargs}
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            self.updated_dashboard = True
+            return {"id": dashboard_id, **kwargs}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.create_chart.fn(
+        dataset_id=10,
+        title="Safe Chart Create",
+        viz_type="table",
+        dashboards="[123]",
+        validate_after_create=False,
+    )
+    payload = json.loads(raw)
+
+    assert payload["id"] == 77
+    assert ws.dashboard_detail_calls == 1  # only precondition check
+    assert ws.updated_dashboard is False
+
+
 def test_get_chart_enriches_datasource_fields(monkeypatch) -> None:
     class _WS(_WorkspaceBase):
         def chart_detail(self, chart_id: int):
@@ -406,6 +452,45 @@ def test_update_dashboard_rejects_dangling_layout_children(monkeypatch) -> None:
         )
     payload = _validation_payload(exc.value)
     assert "dangling child reference" in payload["error"]
+
+
+def test_update_chart_partial_params_reports_strict_semantics(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def chart_detail(self, chart_id: int):
+            return {"id": chart_id, "viz_type": "pie"}
+
+        def get_resource(self, resource_type: str, resource_id: int):
+            assert resource_type == "chart"
+            return {
+                "id": resource_id,
+                "viz_type": "pie",
+                "datasource_id": 42,
+                "params": json.dumps({
+                    "datasource": "42__table",
+                    "metrics": ["count"],
+                    "groupby": ["CHAIN"],
+                }),
+            }
+
+        def dataset_detail(self, dataset_id: int):
+            return {
+                "id": dataset_id,
+                "columns": [{"column_name": "CHAIN"}],
+                "metrics": [{"metric_name": "count"}],
+            }
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError) as exc:
+        server.update_chart.fn(
+            chart_id=1,
+            params_json='{"color_scheme":"supersetColors"}',
+            validate_after_update=False,
+        )
+
+    payload = _validation_payload(exc.value)
+    assert "Strict params semantics" in payload["error"]
+    assert "complete viz-compatible params payload" in payload["error"]
 
 
 def test_list_mutations_reads_local_journal(monkeypatch, tmp_path) -> None:
