@@ -415,6 +415,16 @@ def validate_params_payload(
     if resolved_viz_type == "pie":
         if _is_missing(_value("metrics")):
             raise ValueError("Pie charts require params_json.metrics.")
+        # Backward-compat: ensure singular ``metric`` is present so
+        # Superset backends that derive orderby from it never get null
+        # (see GitHub issue #26).
+        pie_metrics = _value("metrics")
+        if isinstance(pie_metrics, list) and pie_metrics and "metric" not in parsed:
+            parsed["metric"] = pie_metrics[0]
+            warnings.append(
+                "Auto-set params_json.metric from first metrics entry "
+                "for pie chart backward compatibility."
+            )
         has_dimension = not _is_missing(_value("groupby")) or not _is_missing(_value("columns"))
         if not has_dimension:
             raise ValueError("Pie charts require params_json.groupby (or columns).")

@@ -666,6 +666,25 @@ def _validate_position_layout(position_json: dict[str, Any]) -> None:
         if not isinstance(node, dict):
             continue
 
+        # Every layout node must carry an ``id`` that matches its key
+        # and a ``type`` string so the Preset frontend can render it
+        # (see GitHub issue #27).
+        node_id_field = node.get("id")
+        if node_id_field is None:
+            raise ValueError(
+                f"position_json[{node_id!r}] is missing required 'id' field. "
+                "Every layout node must include an 'id' matching its key."
+            )
+        if str(node_id_field) != node_id:
+            raise ValueError(
+                f"position_json[{node_id!r}].id is {node_id_field!r} but must "
+                f"match the node key {node_id!r}."
+            )
+        if not isinstance(node.get("type"), str) or not node.get("type"):
+            raise ValueError(
+                f"position_json[{node_id!r}] is missing required 'type' field."
+            )
+
         children = node.get("children")
         if children is None:
             children = []
@@ -772,12 +791,25 @@ def _dashboard_structure_report(
         node_id for node_id in ("ROOT_ID", "GRID_ID")
         if node_id not in nodes
     ]
+    missing_id_nodes: list[str] = []
+    id_key_mismatches: list[dict[str, Any]] = []
+    missing_type_nodes: list[str] = []
     invalid_children_nodes: list[str] = []
     invalid_parent_nodes: list[str] = []
     dangling_children: list[dict[str, str]] = []
     parent_mismatches: list[dict[str, Any]] = []
 
     for node_id, node in nodes.items():
+        node_id_field = node.get("id")
+        if node_id_field is None:
+            missing_id_nodes.append(node_id)
+        elif str(node_id_field) != node_id:
+            id_key_mismatches.append({
+                "node_key": node_id,
+                "node_id": node_id_field,
+            })
+        if not isinstance(node.get("type"), str) or not node.get("type"):
+            missing_type_nodes.append(node_id)
         children = node.get("children")
         if children is None:
             children = []
@@ -838,7 +870,14 @@ def _dashboard_structure_report(
     attached_missing_layout = sorted(attached_chart_ids - layout_chart_ids)
 
     status = "success"
-    if missing_required_nodes or invalid_children_nodes or dangling_children:
+    if (
+        missing_required_nodes
+        or invalid_children_nodes
+        or dangling_children
+        or missing_id_nodes
+        or id_key_mismatches
+        or missing_type_nodes
+    ):
         status = "failed"
     elif (
         invalid_parent_nodes
@@ -855,6 +894,9 @@ def _dashboard_structure_report(
         "node_count": len(nodes),
         "chart_count_attached": len(attached_chart_ids),
         "missing_required_nodes": missing_required_nodes,
+        "missing_id_nodes": sorted(set(missing_id_nodes)),
+        "id_key_mismatches": id_key_mismatches,
+        "missing_type_nodes": sorted(set(missing_type_nodes)),
         "invalid_children_nodes": sorted(set(invalid_children_nodes)),
         "invalid_parent_nodes": sorted(set(invalid_parent_nodes)),
         "dangling_children": dangling_children,
@@ -1842,6 +1884,182 @@ def query_dataset(
 
 
 # ===================================================================
+# Tools — Dashboard introspection
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def describe_dashboard(
+    dashboard_id: int,
+    include_lineage: bool = False,
+    include_sql: bool = False,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Return a normalized dashboard summary in one call.
+
+    Provides dashboard metadata, markdown blocks, chart inventory,
+    unique dataset inventory, and optional source-table lineage —
+    without requiring multiple follow-up tool calls.
+
+    Args:
+        dashboard_id: Numeric dashboard ID (or use get_dashboard to find it)
+        include_lineage: Parse dataset SQL to extract upstream source tables
+        include_sql: Include raw SQL for each virtual dataset
+        response_mode: 'compact' (counts only), 'standard' (inventory),
+                       or 'full' (all detail + lineage + warnings).
+                       Default: standard.
+    """
+    from preset_py.client import _parse_source_tables
+
+    ws = _get_ws()
+    dashboard = ws.dashboard_detail(dashboard_id)
+    dashboard_charts = ws.dashboard_charts(dashboard_id)
+
+    # Extract markdown blocks from position_json
+    position = _ensure_json_dict(dashboard.get("position_json", {}), "position_json")
+    markdown_blocks: list[dict[str, str]] = []
+    for node_id, node in position.items():
+        if not isinstance(node, dict):
+            continue
+        node_type = node.get("type", "")
+        if node_type != "MARKDOWN":
+            continue
+        meta = node.get("meta", {})
+        if not isinstance(meta, dict):
+            continue
+        code = meta.get("code", "")
+        if isinstance(code, str) and code.strip():
+            markdown_blocks.append({
+                "node_id": node_id,
+                "text": code.strip(),
+            })
+
+    # Build chart inventory and collect unique dataset IDs
+    chart_inventory: list[dict[str, Any]] = []
+    seen_dataset_ids: set[int] = set()
+    dataset_cache: dict[int, dict[str, Any]] = {}
+
+    for chart in dashboard_charts:
+        chart_id_val = _to_int(chart.get("id"))
+        ds_id = _to_int(chart.get("datasource_id"))
+
+        # Try to get datasource_id from form_data if not on chart
+        if ds_id is None:
+            form_data = chart.get("form_data", {})
+            if isinstance(form_data, dict):
+                raw_ds = form_data.get("datasource", "")
+                if isinstance(raw_ds, str) and "__" in raw_ds:
+                    ds_id = _to_int(raw_ds.split("__", 1)[0])
+
+        entry: dict[str, Any] = {
+            "chart_id": chart_id_val,
+            "title": chart.get("slice_name") or chart.get("chart_name"),
+            "viz_type": chart.get("viz_type"),
+            "dataset_id": ds_id,
+        }
+        if ds_id is not None:
+            seen_dataset_ids.add(ds_id)
+        chart_inventory.append(entry)
+
+    # Fetch dataset details
+    dataset_inventory: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for ds_id in sorted(seen_dataset_ids):
+        try:
+            dataset = ws.dataset_detail(ds_id)
+            dataset_cache[ds_id] = dataset
+        except Exception:
+            warnings.append(f"Could not fetch dataset {ds_id}.")
+            continue
+
+        ds_sql = dataset.get("sql")
+        kind = dataset.get("kind") or ("virtual" if ds_sql else "physical")
+
+        ds_entry: dict[str, Any] = {
+            "dataset_id": ds_id,
+            "name": dataset.get("table_name"),
+            "database": None,
+            "schema": dataset.get("schema"),
+            "sql_kind": kind,
+        }
+
+        db_ref = dataset.get("database")
+        if isinstance(db_ref, dict):
+            ds_entry["database"] = db_ref.get("database_name") or db_ref.get("name")
+        elif db_ref is not None:
+            ds_entry["database"] = db_ref
+
+        if include_sql and isinstance(ds_sql, str):
+            ds_entry["sql"] = ds_sql
+
+        if include_lineage or response_mode == "full":
+            if isinstance(ds_sql, str) and ds_sql.strip():
+                if "VALUES" in ds_sql.upper() and "SELECT" in ds_sql.upper():
+                    warnings.append(f"dataset {ds_id} uses inline VALUES snapshot.")
+                source_tables = _parse_source_tables(ds_sql)
+                ds_entry["source_tables"] = source_tables
+                if not source_tables:
+                    warnings.append(f"dataset {ds_id}: could not parse source tables from SQL.")
+            else:
+                ds_entry["source_tables"] = []
+                if kind == "virtual":
+                    warnings.append(f"dataset {ds_id} is virtual but has no SQL.")
+
+        # Enrich chart inventory with dataset names
+        ds_name = dataset.get("table_name")
+        for chart_entry in chart_inventory:
+            if chart_entry.get("dataset_id") == ds_id and ds_name:
+                chart_entry["dataset_name"] = ds_name
+
+        dataset_inventory.append(ds_entry)
+
+    # Assemble response
+    dashboard_meta = {
+        "id": _to_int(dashboard.get("id")) or dashboard_id,
+        "title": dashboard.get("dashboard_title"),
+        "published": dashboard.get("published"),
+        "changed_on": dashboard.get("changed_on"),
+    }
+    owners = dashboard.get("owners")
+    if isinstance(owners, list) and owners:
+        first_owner = owners[0]
+        if isinstance(first_owner, dict):
+            dashboard_meta["owner"] = (
+                first_owner.get("first_name", "")
+                + " "
+                + first_owner.get("last_name", "")
+            ).strip() or first_owner.get("username")
+        elif isinstance(first_owner, str):
+            dashboard_meta["owner"] = first_owner
+
+    if response_mode == "compact":
+        return json.dumps({
+            "dashboard": dashboard_meta,
+            "chart_count": len(chart_inventory),
+            "dataset_count": len(dataset_inventory),
+            "markdown_block_count": len(markdown_blocks),
+            "warning_count": len(warnings),
+        }, indent=2, default=str)
+
+    result: dict[str, Any] = {
+        "dashboard": dashboard_meta,
+        "markdown_blocks": markdown_blocks,
+        "charts": chart_inventory,
+        "datasets": dataset_inventory,
+    }
+
+    if response_mode == "full":
+        result["warnings"] = warnings
+    elif warnings:
+        result["warning_count"] = len(warnings)
+        result["warnings_preview"] = warnings[:3]
+
+    return json.dumps(result, indent=2, default=str)
+
+
+# ===================================================================
 # Tools — Validation
 # ===================================================================
 
@@ -2208,6 +2426,8 @@ def verify_dashboard_structure(
             "layout_orphan_count": len(report.get("layout_orphans", [])),
             "scope_orphan_count": len(report.get("scope_orphans", [])),
             "dangling_child_count": len(report.get("dangling_children", [])),
+            "missing_id_count": len(report.get("missing_id_nodes", [])),
+            "missing_type_count": len(report.get("missing_type_nodes", [])),
         }, indent=2, default=str)
 
     if response_mode == "standard":
@@ -2217,6 +2437,9 @@ def verify_dashboard_structure(
             "node_count": report.get("node_count"),
             "chart_count_attached": report.get("chart_count_attached"),
             "missing_required_nodes": report.get("missing_required_nodes"),
+            "missing_id_nodes": report.get("missing_id_nodes"),
+            "id_key_mismatches": report.get("id_key_mismatches"),
+            "missing_type_nodes": report.get("missing_type_nodes"),
             "dangling_children": report.get("dangling_children"),
             "layout_orphans": report.get("layout_orphans"),
             "scope_orphans": report.get("scope_orphans"),
