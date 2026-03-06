@@ -250,6 +250,13 @@ def _apply_chart_defaults(
         params.setdefault("labels_outside", True)
         if not _coerce_list(params.get("metrics")):
             params["metrics"] = [_default_metric(dataset)]
+        # Backward-compat: some Superset builds derive orderby from the
+        # singular ``metric`` field.  Always set it from the first entry
+        # in ``metrics`` so the query serializer never produces a null
+        # sort column (see GitHub issue #26).
+        metrics_list = _coerce_list(params.get("metrics"))
+        if metrics_list and "metric" not in params:
+            params["metric"] = metrics_list[0]
         if not _coerce_list(params.get("groupby")) and not _coerce_list(params.get("columns")):
             dimension = _default_dimension_column(dataset)
             if not dimension:
@@ -359,6 +366,29 @@ def _coerce_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
+
+
+def _parse_source_tables(sql: str | None) -> list[str]:
+    """Best-effort extraction of source table references from dataset SQL."""
+    if not sql or not sql.strip():
+        return []
+    try:
+        import sqlglot
+        tables: list[str] = []
+        for stmt in sqlglot.parse(sql):
+            if stmt is None:
+                continue
+            for table in stmt.find_all(sqlglot.exp.Table):
+                parts = [
+                    p
+                    for p in (table.catalog, table.db, table.name)
+                    if p
+                ]
+                if parts:
+                    tables.append(".".join(parts))
+        return sorted(set(tables))
+    except Exception:
+        return []
 
 
 def _as_int(value: Any) -> int | None:

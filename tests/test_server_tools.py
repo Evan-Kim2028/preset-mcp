@@ -387,7 +387,7 @@ def test_update_dashboard_blocks_empty_layout_wipe(monkeypatch) -> None:
     with pytest.raises(ToolError) as exc:
         server.update_dashboard.fn(
             dashboard_id=80,
-            position_json='{"DASHBOARD_VERSION_KEY":"v2","ROOT_ID":{"children":["GRID_ID"]},"GRID_ID":{"children":[]}}',
+            position_json='{"DASHBOARD_VERSION_KEY":"v2","ROOT_ID":{"id":"ROOT_ID","type":"ROOT","children":["GRID_ID"]},"GRID_ID":{"id":"GRID_ID","type":"GRID","children":[]}}',
         )
     payload = _validation_payload(exc.value)
     assert payload["error_type"] == "validation"
@@ -422,7 +422,7 @@ def test_update_dashboard_allows_empty_layout_with_override(monkeypatch) -> None
 
     raw = server.update_dashboard.fn(
         dashboard_id=80,
-        position_json='{"DASHBOARD_VERSION_KEY":"v2","ROOT_ID":{"children":["GRID_ID"]},"GRID_ID":{"children":[]}}',
+        position_json='{"DASHBOARD_VERSION_KEY":"v2","ROOT_ID":{"id":"ROOT_ID","type":"ROOT","children":["GRID_ID"]},"GRID_ID":{"id":"GRID_ID","type":"GRID","children":[]}}',
         allow_empty_layout=True,
     )
     payload = json.loads(raw)
@@ -450,9 +450,9 @@ def test_update_dashboard_accepts_dict_payload_and_serializes(monkeypatch) -> No
         dashboard_id=80,
         position_json={
             "DASHBOARD_VERSION_KEY": "v2",
-            "ROOT_ID": {"children": ["GRID_ID"]},
-            "GRID_ID": {"children": ["ROW-1"], "parents": ["ROOT_ID"]},
-            "ROW-1": {"children": [], "parents": ["ROOT_ID", "GRID_ID"]},
+            "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+            "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["ROW-1"], "parents": ["ROOT_ID"]},
+            "ROW-1": {"id": "ROW-1", "type": "ROW", "children": [], "parents": ["ROOT_ID", "GRID_ID"]},
         },
     )
     payload = json.loads(raw)
@@ -475,8 +475,8 @@ def test_update_dashboard_rejects_dangling_layout_children(monkeypatch) -> None:
             dashboard_id=80,
             position_json={
                 "DASHBOARD_VERSION_KEY": "v2",
-                "ROOT_ID": {"children": ["GRID_ID"]},
-                "GRID_ID": {"children": ["ROW-404"]},
+                "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+                "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["ROW-404"]},
             },
         )
     payload = _validation_payload(exc.value)
@@ -552,8 +552,8 @@ def test_restore_dashboard_snapshot_updates_layout(monkeypatch, tmp_path) -> Non
                 "id": 80,
                 "position_json": {
                     "DASHBOARD_VERSION_KEY": "v2",
-                    "ROOT_ID": {"children": ["GRID_ID"]},
-                    "GRID_ID": {"children": [], "parents": ["ROOT_ID"]},
+                    "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+                    "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": [], "parents": ["ROOT_ID"]},
                 },
                 "json_metadata": {"chartsInScope": {}},
             }
@@ -791,3 +791,242 @@ def test_capture_golden_templates_batch(monkeypatch, tmp_path) -> None:
     payload = json.loads(raw)
     assert payload["status"] == "success"
     assert payload["saved_count"] == 2
+
+
+# ===================================================================
+# Issue #26 — pie chart metric/metrics backward compatibility
+# ===================================================================
+
+
+def test_create_chart_pie_sets_singular_metric(monkeypatch) -> None:
+    """Pie charts must set singular ``metric`` from first metrics entry."""
+    captured_params = {}
+
+    class _WS(_WorkspaceBase):
+        def dataset_detail(self, dataset_id: int):
+            return {
+                "id": dataset_id,
+                "columns": [
+                    {"column_name": "CHAIN", "type": "VARCHAR"},
+                    {"column_name": "AMOUNT", "type": "NUMERIC"},
+                ],
+                "metrics": [{"metric_name": "count"}],
+            }
+
+        def create_chart(self, dataset_id: int, title: str, viz_type: str, **kwargs):
+            captured_params.update(kwargs)
+            return {"id": 99, "slice_name": title, "viz_type": viz_type}
+
+        def validate_chart_data(self, chart_id: int, dashboard_id=None, row_limit=10000, force=False):
+            return {"chart_id": chart_id, "status": "success", "error": None}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.create_chart.fn(
+        dataset_id=10,
+        title="Pie Chart",
+        viz_type="pie",
+        metrics='["count"]',
+        groupby='["CHAIN"]',
+        validate_after_create=False,
+    )
+    payload = json.loads(raw)
+    assert payload["id"] == 99
+
+    # The client should have received metrics and the create_chart helper
+    # should have set params including singular ``metric``
+    assert captured_params["metrics"] == ["count"]
+
+
+# ===================================================================
+# Issue #27 — position_json node id/type validation
+# ===================================================================
+
+
+def test_update_dashboard_rejects_nodes_without_id(monkeypatch) -> None:
+    """Nodes missing ``id`` field should be rejected."""
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id, "position_json": {}}
+
+        def dashboard_charts(self, dashboard_id: int):
+            return []
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError) as exc:
+        server.update_dashboard.fn(
+            dashboard_id=80,
+            position_json={
+                "DASHBOARD_VERSION_KEY": "v2",
+                "ROOT_ID": {"type": "ROOT", "children": ["GRID_ID"]},
+                "GRID_ID": {"type": "GRID", "children": []},
+            },
+        )
+    payload = _validation_payload(exc.value)
+    assert "missing required 'id' field" in payload["error"]
+
+
+def test_update_dashboard_rejects_nodes_without_type(monkeypatch) -> None:
+    """Nodes missing ``type`` field should be rejected."""
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id, "position_json": {}}
+
+        def dashboard_charts(self, dashboard_id: int):
+            return []
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError) as exc:
+        server.update_dashboard.fn(
+            dashboard_id=80,
+            position_json={
+                "DASHBOARD_VERSION_KEY": "v2",
+                "ROOT_ID": {"id": "ROOT_ID", "children": ["GRID_ID"]},
+                "GRID_ID": {"id": "GRID_ID", "children": []},
+            },
+        )
+    payload = _validation_payload(exc.value)
+    assert "missing required 'type' field" in payload["error"]
+
+
+def test_update_dashboard_rejects_id_key_mismatch(monkeypatch) -> None:
+    """Node ``id`` must match the dict key."""
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id, "position_json": {}}
+
+        def dashboard_charts(self, dashboard_id: int):
+            return []
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError) as exc:
+        server.update_dashboard.fn(
+            dashboard_id=80,
+            position_json={
+                "DASHBOARD_VERSION_KEY": "v2",
+                "ROOT_ID": {"id": "WRONG_ID", "type": "ROOT", "children": ["GRID_ID"]},
+                "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": []},
+            },
+        )
+    payload = _validation_payload(exc.value)
+    assert "must match the node key" in payload["error"]
+
+
+def test_verify_dashboard_structure_detects_missing_node_ids(monkeypatch) -> None:
+    """verify_dashboard_structure should flag nodes without id/type."""
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "dashboard_title": "Bad Layout",
+                "position_json": {
+                    "ROOT_ID": {"type": "ROOT", "children": ["GRID_ID"]},
+                    "GRID_ID": {"children": []},
+                },
+                "json_metadata": {},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return []
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.verify_dashboard_structure.fn(
+        dashboard_id=80, response_mode="standard",
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "failed"
+    assert "ROOT_ID" in payload["missing_id_nodes"]
+    assert "GRID_ID" in payload["missing_id_nodes"]
+    assert "GRID_ID" in payload["missing_type_nodes"]
+
+
+# ===================================================================
+# Issue #28 — describe_dashboard
+# ===================================================================
+
+
+def test_describe_dashboard_standard(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "dashboard_title": "Research Yield",
+                "published": False,
+                "changed_on": "2026-03-05T21:52:01",
+                "owners": [{"first_name": "Evan", "last_name": "Kim"}],
+                "position_json": {
+                    "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+                    "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["MARKDOWN-1", "CHART-1"]},
+                    "MARKDOWN-1": {"id": "MARKDOWN-1", "type": "MARKDOWN", "children": [], "meta": {"code": "## Overview\nYield analysis"}},
+                    "CHART-1": {"id": "CHART-1", "type": "CHART", "children": [], "meta": {"chartId": 100}},
+                },
+                "json_metadata": {},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return [
+                {
+                    "id": 100,
+                    "slice_name": "Yield Pie",
+                    "viz_type": "pie",
+                    "datasource_id": 50,
+                    "datasource_type": "table",
+                    "form_data": {"datasource": "50__table"},
+                }
+            ]
+
+        def dataset_detail(self, dataset_id: int):
+            return {
+                "id": dataset_id,
+                "table_name": "yield_data",
+                "schema": "analytics",
+                "database": {"database_name": "snowflake_prod"},
+                "sql": "SELECT * FROM raw.yield_rates",
+                "kind": "virtual",
+            }
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.describe_dashboard.fn(
+        dashboard_id=171,
+        include_lineage=True,
+        response_mode="standard",
+    )
+    payload = json.loads(raw)
+
+    assert payload["dashboard"]["title"] == "Research Yield"
+    assert payload["dashboard"]["owner"] == "Evan Kim"
+    assert len(payload["markdown_blocks"]) == 1
+    assert "Yield analysis" in payload["markdown_blocks"][0]["text"]
+    assert len(payload["charts"]) == 1
+    assert payload["charts"][0]["chart_id"] == 100
+    assert payload["charts"][0]["dataset_name"] == "yield_data"
+    assert len(payload["datasets"]) == 1
+    assert payload["datasets"][0]["database"] == "snowflake_prod"
+    assert payload["datasets"][0]["source_tables"]
+
+
+def test_describe_dashboard_compact(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "dashboard_title": "Test",
+                "position_json": {},
+                "json_metadata": {},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return []
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.describe_dashboard.fn(
+        dashboard_id=1,
+        response_mode="compact",
+    )
+    payload = json.loads(raw)
+    assert payload["chart_count"] == 0
+    assert payload["dataset_count"] == 0

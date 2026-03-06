@@ -69,6 +69,30 @@ def test_params_payload_enforces_pie_required_fields() -> None:
         )
 
 
+def test_params_payload_pie_auto_sets_singular_metric() -> None:
+    """Pie chart params_json should auto-derive metric from metrics."""
+    parsed, warnings = validate_params_payload(
+        '{"metrics":["count"],"groupby":["CHAIN"]}',
+        dataset_columns={"CHAIN"},
+        dataset_metrics={"count"},
+        viz_type="pie",
+    )
+    assert parsed["metric"] == "count"
+    assert any("Auto-set" in w for w in warnings)
+
+
+def test_params_payload_pie_preserves_explicit_metric() -> None:
+    """If metric is already set, don't override it."""
+    parsed, warnings = validate_params_payload(
+        '{"metrics":["count"],"metric":"explicit_metric","groupby":["CHAIN"]}',
+        dataset_columns={"CHAIN"},
+        dataset_metrics={"count", "explicit_metric"},
+        viz_type="pie",
+    )
+    assert parsed["metric"] == "explicit_metric"
+    assert not any("Auto-set" in w for w in warnings)
+
+
 def test_params_payload_enforces_timeseries_required_fields() -> None:
     with pytest.raises(ValueError, match="requires params_json.metrics"):
         validate_params_payload(
