@@ -54,7 +54,8 @@ from preset_py._safety import (
     validate_params_payload,
     validate_position_layout,
 )
-from preset_py._viz_specs import validate_chart_envelope
+from preset_py._viz_specs import validate_chart_envelope, KNOWN_VIZ_TYPES, DISCOURAGED_VIZ_TYPES
+from preset_py._helpers import to_int as _helpers_to_int
 
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via PRESET_MCP_* env vars)
@@ -291,40 +292,12 @@ def _filter_by_name(records: list[dict], resource: str, name_contains: str) -> l
 # Input coercion + validation helpers
 # ---------------------------------------------------------------------------
 
-_KNOWN_VIZ_TYPES = frozenset({
-    "area",
-    "big_number_total",
-    "dist_bar",
-    "echarts_area",
-    "echarts_bar",
-    "echarts_timeseries_area",
-    "echarts_timeseries_bar",
-    "echarts_timeseries_line",
-    "histogram_v2",
-    "line",
-    "mixed_timeseries",
-    "pie",
-    "pivot_table_v2",
-    "sankey_v2",
-    "sunburst_v2",
-    "table",
-    "treemap_v2",
-})
-
-_DISCOURAGED_VIZ_TYPES: dict[str, str] = {
-    # Legacy/deprecated aliases seen to fail in modern Preset workspaces.
-    "echarts_bar": "echarts_timeseries_bar",
-}
+_KNOWN_VIZ_TYPES = KNOWN_VIZ_TYPES
+_DISCOURAGED_VIZ_TYPES = DISCOURAGED_VIZ_TYPES
 
 
 def _to_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
+    return _helpers_to_int(value)
 
 
 def _ensure_json_dict(value: Any, field_name: str) -> dict[str, Any]:
@@ -397,36 +370,13 @@ def _coerce_list_arg(
 
 
 def _dataset_columns(dataset: dict[str, Any]) -> set[str]:
-    columns = dataset.get("columns", [])
-    if not isinstance(columns, list):
-        return set()
-    names: set[str] = set()
-    for column in columns:
-        if not isinstance(column, dict):
-            continue
-        name = column.get("column_name") or column.get("name")
-        if isinstance(name, str):
-            names.add(name)
-    return names
+    from preset_py._helpers import dataset_column_names
+    return dataset_column_names(dataset)
 
 
 def _dataset_metrics(dataset: dict[str, Any]) -> set[str]:
-    metrics = dataset.get("metrics", [])
-    if not isinstance(metrics, list):
-        return set()
-    names: set[str] = set()
-    for metric in metrics:
-        if isinstance(metric, str):
-            names.add(metric)
-            continue
-        if not isinstance(metric, dict):
-            continue
-        for key in ("metric_name", "label", "name"):
-            value = metric.get(key)
-            if isinstance(value, str) and value:
-                names.add(value)
-                break
-    return names
+    from preset_py._helpers import dataset_metric_names
+    return dataset_metric_names(dataset)
 
 
 def _require_dataset_exists(ws: PresetWorkspace, dataset_id: int) -> None:
@@ -473,9 +423,8 @@ def _collect_workspace_viz_types(ws: PresetWorkspace) -> set[str]:
             viz = chart.get("viz_type")
             if isinstance(viz, str) and viz:
                 viz_types.add(viz)
-    except Exception:
-        # Non-blocking fallback to curated defaults.
-        pass
+    except Exception as exc:
+        _log.debug("viz type discovery failed (using curated defaults): %s", exc)
     return viz_types
 
 
@@ -567,15 +516,15 @@ def _enrich_chart_datasource_fields(ws: PresetWorkspace, chart: dict[str, Any]) 
                     ds_id = ds_id or _to_int(listing.get("datasource_id"))
                     ds_type = ds_type or listing.get("datasource_type")
                     ds_name = ds_name or listing.get("datasource_name_text") or listing.get("datasource_name")
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("chart listing enrichment failed for chart %s: %s", enriched.get("id"), exc)
 
     if ds_name is None and ds_id is not None:
         try:
             dataset = ws.dataset_detail(ds_id)
             ds_name = dataset.get("table_name") or dataset.get("datasource_name_text")
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("dataset name enrichment failed for ds %s: %s", ds_id, exc)
 
     if ds_id is not None:
         enriched["datasource_id"] = ds_id
@@ -870,7 +819,8 @@ def _template_chart_specs(
         if include_query_context or not isinstance(chart.get("form_data"), dict):
             try:
                 detail = ws.chart_detail(chart_id)
-            except Exception:
+            except Exception as exc:
+                _log.debug("chart_detail fetch failed for chart %s: %s", chart_id, exc)
                 detail = None
             if isinstance(detail, dict):
                 chart_detail_cache[chart_id] = detail
@@ -919,7 +869,8 @@ def _template_chart_specs(
             if dataset is None:
                 try:
                     dataset = ws.dataset_detail(datasource_id)
-                except Exception:
+                except Exception as exc:
+                    _log.debug("dataset_detail failed for ds %s: %s", datasource_id, exc)
                     dataset = {}
                 dataset_cache[datasource_id] = dataset
             if isinstance(dataset, dict):

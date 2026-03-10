@@ -19,6 +19,20 @@ from preset_cli.api.clients.superset import SupersetClient
 
 from preset_py.snapshot import WorkspaceSnapshot, take_snapshot
 from preset_py._viz_specs import VIZ_SPECS, TIMESERIES_VIZ_TYPES, validate_chart_envelope
+from preset_py._helpers import (
+    to_int as _as_int,
+    coerce_list as _coerce_list,
+    column_name as _column_name,
+    column_type_name as _column_type_name,
+    is_numeric_column as _is_numeric_column,
+    is_temporal_column as _is_temporal_column,
+    metric_column_name as _metric_column_name,
+    metric_label as _metric_label,
+    saved_metric_name as _saved_metric_name,
+    dataset_column_names as _dataset_column_names,
+    dataset_metric_names as _dataset_metric_names,
+    dataset_columns as _dataset_columns,
+)
 
 PRESET_API_URL = "https://api.app.preset.io/"
 
@@ -76,49 +90,9 @@ def _column_map(dataset: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return mapped
 
 
-def _dataset_columns(dataset: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return dataset columns as a normalized list of dicts."""
-    columns = dataset.get("columns", [])
-    if not isinstance(columns, list):
-        return []
-    return [column for column in columns if isinstance(column, dict)]
 
-
-def _column_name(column: dict[str, Any]) -> str | None:
-    """Extract a normalized dataset column name."""
-    for key in ("column_name", "name"):
-        value = column.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def _column_type_name(column: dict[str, Any]) -> str:
-    """Return a normalized type name from dataset column metadata."""
-    for key in ("type", "type_generic", "python_date_format"):
-        raw = column.get(key)
-        if isinstance(raw, str) and raw.strip():
-            return raw.strip().upper()
-    return ""
-
-
-def _is_numeric_column(column: dict[str, Any]) -> bool:
-    """Best-effort numeric column detection from Superset metadata."""
-    type_name = _column_type_name(column)
-    numeric_tokens = (
-        "INT", "NUMBER", "NUMERIC", "DECIMAL", "FLOAT", "DOUBLE",
-        "REAL", "BIGINT", "SMALLINT", "TINYINT",
-    )
-    return any(token in type_name for token in numeric_tokens)
-
-
-def _is_temporal_column(column: dict[str, Any]) -> bool:
-    """Best-effort temporal column detection from dataset metadata."""
-    if column.get("is_dttm") is True:
-        return True
-    type_name = _column_type_name(column)
-    temporal_tokens = ("DATE", "TIME", "TIMESTAMP", "DATETIME")
-    return any(token in type_name for token in temporal_tokens)
+# _dataset_columns, _column_name, _column_type_name, _is_numeric_column,
+# _is_temporal_column — imported from _helpers
 
 
 def _simple_metric_from_column(column_name: str, column: dict[str, Any]) -> dict[str, Any]:
@@ -165,17 +139,8 @@ def _normalize_create_metrics(
     return normalized
 
 
-def _saved_metric_name(metric: Any) -> str | None:
-    """Extract metric name from dataset metric payload shapes."""
-    if isinstance(metric, str) and metric:
-        return metric
-    if not isinstance(metric, dict):
-        return None
-    for key in ("metric_name", "label", "name"):
-        value = metric.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
+
+# _saved_metric_name — imported from _helpers
 
 
 def _default_metric(dataset: dict[str, Any]) -> Any:
@@ -370,15 +335,8 @@ def _create_chart(
     return client.create_resource("chart", **payload)
 
 
-def _coerce_list(value: Any) -> list[Any]:
-    """Normalize scalar/list-like values to a list."""
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
-    return [value]
+
+# _coerce_list — imported from _helpers
 
 
 def _parse_source_tables(sql: str | None) -> list[str]:
@@ -400,21 +358,13 @@ def _parse_source_tables(sql: str | None) -> list[str]:
                 if parts:
                     tables.append(".".join(parts))
         return sorted(set(tables))
-    except Exception:
+    except (ImportError, Exception):
+        # sqlglot parsing is best-effort; return empty on any failure.
         return []
 
 
-def _as_int(value: Any) -> int | None:
-    """Convert values like numeric strings to integers."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
+
+# _as_int — imported from _helpers (as to_int)
 
 
 def _normalize_filters(filters: Any) -> list[Any]:
@@ -437,43 +387,8 @@ def _safe_set(values: list[Any]) -> set[str]:
     return normalized
 
 
-def _dataset_column_names(dataset: dict[str, Any]) -> set[str]:
-    """Extract column names from a dataset payload in flexible shapes."""
-    raw_columns = dataset.get("columns")
-    columns: list[Any] = []
-    if isinstance(raw_columns, list):
-        columns.extend(raw_columns)
-    elif isinstance(raw_columns, dict):
-        columns.extend(raw_columns.values())
-    extracted: list[Any] = []
-    for column in columns:
-        if isinstance(column, dict):
-            extracted.append(
-                column.get("column_name")
-                or column.get("name")
-                or column.get("id")
-            )
-        else:
-            extracted.append(column)
-    return _safe_set(extracted)
 
-
-def _dataset_metric_names(dataset: dict[str, Any]) -> set[str]:
-    """Extract dataset metric names from a dataset payload in flexible shapes."""
-    metrics = dataset.get("metrics", [])
-    if not isinstance(metrics, list):
-        return set()
-    extracted: list[Any] = []
-    for metric in metrics:
-        if isinstance(metric, dict):
-            extracted.append(
-                metric.get("metric_name")
-                or metric.get("label")
-                or metric.get("name")
-            )
-        else:
-            extracted.append(metric)
-    return _safe_set(extracted)
+# _dataset_column_names, _dataset_metric_names — imported from _helpers
 
 
 def _metric_to_adhoc(column_name: str) -> dict[str, Any]:
@@ -487,38 +402,8 @@ def _metric_to_adhoc(column_name: str) -> dict[str, Any]:
     }
 
 
-def _metric_column_name(metric: dict[str, Any]) -> str | None:
-    """Extract a metric column reference when available."""
-    column = metric.get("column")
-    if isinstance(column, str):
-        return column
-    if isinstance(column, dict):
-        value = column.get("column_name") or column.get("name")
-        if isinstance(value, str) and value:
-            return value
-    return None
 
-
-def _metric_label(metric: Any) -> str | None:
-    """Get a stable label used by Superset for sorting and display."""
-    if isinstance(metric, str):
-        return metric
-    if isinstance(metric, dict):
-        label = metric.get("label") or metric.get("label_short")
-        if label:
-            return str(label)
-        metric_name = metric.get("metric_name") or metric.get("name")
-        if isinstance(metric_name, str) and metric_name:
-            return metric_name
-        if metric.get("expressionType") == "SQL" and metric.get("sqlExpression"):
-            return str(metric["sqlExpression"])
-        column_name = _metric_column_name(metric)
-        aggregate = metric.get("aggregate")
-        if isinstance(aggregate, str) and aggregate and column_name:
-            return f"{aggregate}({column_name})"
-        if column_name:
-            return column_name
-    return None
+# _metric_column_name, _metric_label — imported from _helpers
 
 
 def _normalize_metrics(

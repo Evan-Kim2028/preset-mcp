@@ -12,6 +12,7 @@ from typing import Any, Literal, TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from preset_py._viz_specs import VIZ_SPECS, check_required_fields
+from preset_py._helpers import metric_column_name as _metric_column_name, metric_label as _metric_label
 
 if TYPE_CHECKING:
     from preset_py.client import PresetWorkspace
@@ -160,40 +161,8 @@ _VIZ_DIMENSION_KEYS = (
     "granularity_sqla",
 )
 
-def _metric_column_name(metric: dict[str, Any]) -> str | None:
-    """Extract a metric's referenced column name, if present."""
-    column = metric.get("column")
-    if isinstance(column, str):
-        return column
-    if isinstance(column, dict):
-        name = column.get("column_name") or column.get("name")
-        if isinstance(name, str):
-            return name
-    return None
 
-
-def _metric_label(metric: Any) -> str | None:
-    """Derive the effective metric label Superset uses for display/orderby."""
-    if isinstance(metric, str):
-        return metric
-    if not isinstance(metric, dict):
-        return None
-
-    for key in ("label", "label_short", "metric_name", "name"):
-        value = metric.get(key)
-        if isinstance(value, str) and value:
-            return value
-
-    if metric.get("expressionType") == "SQL":
-        sql_expr = metric.get("sqlExpression")
-        if isinstance(sql_expr, str) and sql_expr.strip():
-            return sql_expr.strip()
-
-    col_name = _metric_column_name(metric)
-    aggregate = metric.get("aggregate")
-    if isinstance(aggregate, str) and aggregate and col_name:
-        return f"{aggregate}({col_name})"
-    return col_name
+# _metric_column_name, _metric_label — imported from _helpers
 
 
 def _validate_metric_object(metric: dict[str, Any], index: int) -> str | None:

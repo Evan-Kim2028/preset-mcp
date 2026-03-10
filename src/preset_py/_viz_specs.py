@@ -101,6 +101,33 @@ TIMESERIES_VIZ_TYPES = frozenset(
     name for name, spec in VIZ_SPECS.items() if spec.needs_time_column
 )
 
+# Curated set of viz types known to work in modern Preset workspaces.
+# Supplemented at runtime by dynamically-discovered types from charts.
+KNOWN_VIZ_TYPES: frozenset[str] = frozenset({
+    "area",
+    "big_number_total",
+    "dist_bar",
+    "echarts_area",
+    "echarts_bar",
+    "echarts_timeseries_area",
+    "echarts_timeseries_bar",
+    "echarts_timeseries_line",
+    "histogram_v2",
+    "line",
+    "mixed_timeseries",
+    "pie",
+    "pivot_table_v2",
+    "sankey_v2",
+    "sunburst_v2",
+    "table",
+    "treemap_v2",
+})
+
+# Legacy/deprecated aliases that should be replaced.
+DISCOURAGED_VIZ_TYPES: dict[str, str] = {
+    "echarts_bar": "echarts_timeseries_bar",
+}
+
 
 def get_viz_spec(viz_type: str) -> VizSpec | None:
     """Look up the spec for *viz_type*, returning ``None`` if unknown."""
