@@ -1030,3 +1030,457 @@ def test_describe_dashboard_compact(monkeypatch) -> None:
     payload = json.loads(raw)
     assert payload["chart_count"] == 0
     assert payload["dataset_count"] == 0
+
+
+# ===================================================================
+# Snapshot & recovery — comprehensive tests
+# ===================================================================
+
+
+def test_list_snapshots_returns_all_types(monkeypatch, tmp_path) -> None:
+    """list_snapshots with no resource_type returns snapshots for all types."""
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    (snapshots / "dashboard_1_20260304T120000000000Z.json").write_text("{}")
+    (snapshots / "chart_2_20260304T120100000000Z.json").write_text("{}")
+    (snapshots / "dataset_3_20260304T120200000000Z.json").write_text("{}")
+
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+
+    raw = server.list_snapshots.fn(limit=50)
+    payload = json.loads(raw)
+    assert payload["count"] == 3
+    types = {s["resource_type"] for s in payload["snapshots"]}
+    assert types == {"dashboard", "chart", "dataset"}
+
+
+def test_list_snapshots_filters_by_resource_type(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    (snapshots / "dashboard_1_20260304T120000000000Z.json").write_text("{}")
+    (snapshots / "chart_2_20260304T120100000000Z.json").write_text("{}")
+    (snapshots / "dataset_3_20260304T120200000000Z.json").write_text("{}")
+
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+
+    raw = server.list_snapshots.fn(resource_type="chart", limit=50)
+    payload = json.loads(raw)
+    assert payload["count"] == 1
+    assert payload["snapshots"][0]["resource_type"] == "chart"
+    assert payload["snapshots"][0]["resource_id"] == 2
+
+
+def test_list_snapshots_filters_by_resource_id(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    (snapshots / "chart_10_20260304T120000000000Z.json").write_text("{}")
+    (snapshots / "chart_11_20260304T120100000000Z.json").write_text("{}")
+
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+
+    raw = server.list_snapshots.fn(resource_type="chart", resource_id=10, limit=50)
+    payload = json.loads(raw)
+    assert payload["count"] == 1
+    assert payload["snapshots"][0]["resource_id"] == 10
+
+
+def test_list_snapshots_empty_directory(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+    raw = server.list_snapshots.fn(limit=50)
+    payload = json.loads(raw)
+    assert payload["count"] == 0
+    assert payload["snapshots"] == []
+
+
+def test_list_mutations_filters_by_action(monkeypatch, tmp_path) -> None:
+    journal_file = tmp_path / "mutations.jsonl"
+    journal_file.write_text(
+        "\n".join([
+            '{"timestamp":"2026-03-04T10:00:00Z","tool_name":"update_dashboard","resource_type":"dashboard","resource_id":80,"action":"update"}',
+            '{"timestamp":"2026-03-04T11:00:00Z","tool_name":"create_chart","resource_type":"chart","resource_id":12,"action":"create"}',
+            '{"timestamp":"2026-03-04T12:00:00Z","tool_name":"delete_chart","resource_type":"chart","resource_id":13,"action":"delete"}',
+        ])
+        + "\n"
+    )
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+
+    raw = server.list_mutations.fn(action="create", limit=50)
+    payload = json.loads(raw)
+    assert payload["count"] == 1
+    assert payload["entries"][0]["action"] == "create"
+    assert payload["entries"][0]["resource_id"] == 12
+
+
+def test_list_mutations_combined_filters(monkeypatch, tmp_path) -> None:
+    journal_file = tmp_path / "mutations.jsonl"
+    journal_file.write_text(
+        "\n".join([
+            '{"timestamp":"2026-03-04T10:00:00Z","tool_name":"update_dashboard","resource_type":"dashboard","resource_id":80,"action":"update"}',
+            '{"timestamp":"2026-03-04T11:00:00Z","tool_name":"update_chart","resource_type":"chart","resource_id":12,"action":"update"}',
+            '{"timestamp":"2026-03-04T12:00:00Z","tool_name":"create_chart","resource_type":"chart","resource_id":13,"action":"create"}',
+        ])
+        + "\n"
+    )
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+
+    raw = server.list_mutations.fn(resource_type="chart", action="update", limit=50)
+    payload = json.loads(raw)
+    assert payload["count"] == 1
+    assert payload["entries"][0]["resource_id"] == 12
+
+
+def test_list_mutations_empty_journal(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+    raw = server.list_mutations.fn(limit=50)
+    payload = json.loads(raw)
+    assert payload["count"] == 0
+
+
+def test_list_mutations_malformed_lines(monkeypatch, tmp_path) -> None:
+    journal_file = tmp_path / "mutations.jsonl"
+    journal_file.write_text(
+        "not valid json\n"
+        '{"timestamp":"2026-03-04T10:00:00Z","tool_name":"update_chart","resource_type":"chart","resource_id":1,"action":"update"}\n'
+        "\n"
+        "42\n"
+    )
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+
+    raw = server.list_mutations.fn(limit=50)
+    payload = json.loads(raw)
+    assert payload["count"] == 1
+
+
+def test_list_mutations_reverse_chronological(monkeypatch, tmp_path) -> None:
+    journal_file = tmp_path / "mutations.jsonl"
+    journal_file.write_text(
+        "\n".join([
+            '{"timestamp":"2026-03-04T08:00:00Z","tool_name":"t1","resource_type":"chart","resource_id":1,"action":"create"}',
+            '{"timestamp":"2026-03-04T12:00:00Z","tool_name":"t2","resource_type":"chart","resource_id":2,"action":"update"}',
+            '{"timestamp":"2026-03-04T10:00:00Z","tool_name":"t3","resource_type":"chart","resource_id":3,"action":"delete"}',
+        ])
+        + "\n"
+    )
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+
+    raw = server.list_mutations.fn(limit=50)
+    payload = json.loads(raw)
+    timestamps = [e["timestamp"] for e in payload["entries"]]
+    assert timestamps == sorted(timestamps, reverse=True)
+
+
+def test_restore_chart_snapshot_restores_params_and_viz(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "chart_10_20260304T120000000000Z.json"
+    snapshot.write_text(json.dumps({
+        "id": 10,
+        "viz_type": "pie",
+        "params": {"metrics": ["count"], "groupby": ["region"]},
+    }))
+
+    class _WS(_WorkspaceBase):
+        def __init__(self):
+            self.updated = None
+
+        def chart_detail(self, chart_id: int):
+            return {"id": chart_id}
+
+        def update_chart(self, chart_id: int, **kwargs):
+            self.updated = kwargs
+            return {"id": chart_id, **kwargs}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.restore_chart_snapshot.fn(
+        chart_id=10,
+        snapshot_path=str(snapshot),
+    )
+    payload = json.loads(raw)
+    assert payload["id"] == 10
+    assert ws.updated is not None
+    assert "params" in ws.updated
+    assert "viz_type" in ws.updated
+    assert ws.updated["viz_type"] == "pie"
+
+
+def test_restore_chart_snapshot_dry_run(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "chart_10_20260304T120000000000Z.json"
+    snapshot.write_text(json.dumps({
+        "id": 10,
+        "viz_type": "table",
+        "params": {"metrics": ["count"]},
+    }))
+
+    class _WS(_WorkspaceBase):
+        def chart_detail(self, chart_id: int):
+            return {"id": chart_id}
+
+        def update_chart(self, chart_id: int, **kwargs):
+            raise AssertionError("Should not be called in dry_run")
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.restore_chart_snapshot.fn(
+        chart_id=10,
+        snapshot_path=str(snapshot),
+        dry_run=True,
+    )
+    payload = json.loads(raw)
+    assert payload["dry_run"] is True
+
+
+def test_restore_chart_snapshot_id_mismatch(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "chart_10_20260304T120000000000Z.json"
+    snapshot.write_text(json.dumps({
+        "id": 99,
+        "viz_type": "table",
+        "params": {"metrics": ["count"]},
+    }))
+
+    class _WS(_WorkspaceBase):
+        def chart_detail(self, chart_id: int):
+            return {"id": chart_id}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError):
+        server.restore_chart_snapshot.fn(
+            chart_id=10,
+            snapshot_path=str(snapshot),
+        )
+
+
+def test_restore_dataset_snapshot_restores_sql(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "dataset_5_20260304T120000000000Z.json"
+    snapshot.write_text(json.dumps({
+        "id": 5,
+        "sql": "SELECT * FROM orders",
+        "table_name": "orders_v2",
+        "description": "Order data",
+    }))
+
+    class _WS(_WorkspaceBase):
+        def __init__(self):
+            self.updated = None
+
+        def dataset_detail(self, dataset_id: int):
+            return {"id": dataset_id}
+
+        def update_dataset(self, dataset_id: int, **kwargs):
+            self.updated = kwargs
+            return {"id": dataset_id, **kwargs}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.restore_dataset_snapshot.fn(
+        dataset_id=5,
+        snapshot_path=str(snapshot),
+    )
+    payload = json.loads(raw)
+    assert payload["id"] == 5
+    assert ws.updated is not None
+    assert ws.updated["sql"] == "SELECT * FROM orders"
+    assert ws.updated["table_name"] == "orders_v2"
+    assert ws.updated["description"] == "Order data"
+
+
+def test_restore_dataset_snapshot_dry_run(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "dataset_5_20260304T120000000000Z.json"
+    snapshot.write_text(json.dumps({
+        "id": 5,
+        "sql": "SELECT 1",
+        "table_name": "test",
+    }))
+
+    class _WS(_WorkspaceBase):
+        def dataset_detail(self, dataset_id: int):
+            return {"id": dataset_id}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.restore_dataset_snapshot.fn(
+        dataset_id=5,
+        snapshot_path=str(snapshot),
+        dry_run=True,
+    )
+    payload = json.loads(raw)
+    assert payload["dry_run"] is True
+
+
+def test_restore_dataset_snapshot_id_mismatch(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "dataset_5_20260304T120000000000Z.json"
+    snapshot.write_text(json.dumps({
+        "id": 99,
+        "sql": "SELECT 1",
+    }))
+
+    class _WS(_WorkspaceBase):
+        def dataset_detail(self, dataset_id: int):
+            return {"id": dataset_id}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError):
+        server.restore_dataset_snapshot.fn(
+            dataset_id=5,
+            snapshot_path=str(snapshot),
+        )
+
+
+def test_restore_dashboard_snapshot_validates_chart_refs(monkeypatch, tmp_path) -> None:
+    """Dashboard restore should warn about missing chart references."""
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "dashboard_80_20260304T120000000000Z.json"
+    snapshot.write_text(json.dumps({
+        "id": 80,
+        "position_json": {
+            "DASHBOARD_VERSION_KEY": "v2",
+            "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+            "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["CHART-abc"], "parents": ["ROOT_ID"]},
+            "CHART-abc": {"id": "CHART-abc", "type": "CHART", "children": [], "parents": ["GRID_ID"], "meta": {"chartId": 999}},
+        },
+        "json_metadata": {},
+    }))
+
+    class _WS(_WorkspaceBase):
+        def __init__(self):
+            self.updated = None
+
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id}
+
+        def charts(self):
+            return [{"id": 1}, {"id": 2}]  # chart 999 doesn't exist
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            self.updated = kwargs
+            return {"id": dashboard_id, **kwargs}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.restore_dashboard_snapshot.fn(
+        dashboard_id=80,
+        snapshot_path=str(snapshot),
+        validate_chart_refs=True,
+    )
+    payload = json.loads(raw)
+    assert "_warnings" in payload
+    assert any("999" in w for w in payload["_warnings"])
+
+
+def test_restore_dashboard_snapshot_no_metadata(monkeypatch, tmp_path) -> None:
+    """Test restore with restore_json_metadata=False."""
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "dashboard_80_20260304T120000000000Z.json"
+    snapshot.write_text(json.dumps({
+        "id": 80,
+        "position_json": {
+            "DASHBOARD_VERSION_KEY": "v2",
+            "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+            "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": [], "parents": ["ROOT_ID"]},
+        },
+        "json_metadata": {"chartsInScope": {}},
+    }))
+
+    class _WS(_WorkspaceBase):
+        def __init__(self):
+            self.updated = None
+
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id}
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            self.updated = kwargs
+            return {"id": dashboard_id, **kwargs}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.restore_dashboard_snapshot.fn(
+        dashboard_id=80,
+        snapshot_path=str(snapshot),
+        restore_json_metadata=False,
+    )
+    payload = json.loads(raw)
+    assert "position_json" in ws.updated
+    assert "json_metadata" not in ws.updated
+
+
+def test_snapshot_not_found_raises(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def chart_detail(self, chart_id: int):
+            return {"id": chart_id}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError):
+        server.restore_chart_snapshot.fn(
+            chart_id=10,
+            snapshot_path="/nonexistent/path/snapshot.json",
+        )
+
+
+def test_snapshot_invalid_json_raises(monkeypatch, tmp_path) -> None:
+    bad_snap = tmp_path / "bad.json"
+    bad_snap.write_text("not json {{{")
+
+    class _WS(_WorkspaceBase):
+        def dataset_detail(self, dataset_id: int):
+            return {"id": dataset_id}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError):
+        server.restore_dataset_snapshot.fn(
+            dataset_id=1,
+            snapshot_path=str(bad_snap),
+        )
+
+
+def test_prune_snapshots_removes_old(monkeypatch, tmp_path) -> None:
+    import os
+
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+
+    old_file = snapshots / "chart_1_20200101T000000000000Z.json"
+    old_file.write_text("{}")
+    # Set mtime to 60 days ago
+    old_time = (
+        __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        - __import__("datetime").timedelta(days=60)
+    ).timestamp()
+    os.utime(old_file, (old_time, old_time))
+
+    new_file = snapshots / "chart_2_20260304T120000000000Z.json"
+    new_file.write_text("{}")
+
+    monkeypatch.setattr(server, "AUDIT_DIR", tmp_path)
+
+    raw = server.prune_snapshots.fn(max_age_days=30)
+    payload = json.loads(raw)
+    assert payload["snapshots_removed"] == 1
+    assert not old_file.exists()
+    assert new_file.exists()

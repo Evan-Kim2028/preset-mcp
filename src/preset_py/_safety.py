@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, TYPE_CHECKING
 
@@ -82,7 +82,7 @@ def capture_before(
         try:
             snap_dir = AUDIT_DIR / "snapshots"
             snap_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             snap_file = snap_dir / f"{resource_type}_{resource_id}_{ts}.json"
             snap_file.write_text(json.dumps(data, indent=2, default=str) + "\n")
         except Exception as exc:
@@ -446,6 +446,76 @@ def validate_params_payload(
     if resolved_viz_type == "big_number_total" and _is_missing(_value("metrics")):
         raise ValueError("big_number_total requires params_json.metrics.")
 
+    if resolved_viz_type == "big_number" and _is_missing(_value("metrics")):
+        raise ValueError("big_number requires params_json.metrics.")
+
+    if resolved_viz_type == "table":
+        has_metrics = not _is_missing(_value("metrics"))
+        has_dimensions = not _is_missing(_value("groupby")) or not _is_missing(_value("columns"))
+        if not has_metrics and not has_dimensions:
+            raise ValueError(
+                "table requires at least one of params_json.metrics or "
+                "params_json.groupby/columns."
+            )
+
+    if resolved_viz_type == "heatmap":
+        if _is_missing(_value("metrics")):
+            raise ValueError("heatmap requires params_json.metrics.")
+        if _is_missing(_value("x_axis")) and _is_missing(_value("groupby")):
+            raise ValueError("heatmap requires params_json.x_axis (or groupby).")
+        if _is_missing(_value("y_axis")) and _is_missing(_value("columns")):
+            raise ValueError("heatmap requires params_json.y_axis (or columns).")
+
+    if resolved_viz_type in {"dist_bar", "echarts_bar"}:
+        if _is_missing(_value("metrics")):
+            raise ValueError(f"{resolved_viz_type} requires params_json.metrics.")
+        has_dimension = not _is_missing(_value("groupby")) or not _is_missing(_value("columns"))
+        if not has_dimension:
+            raise ValueError(
+                f"{resolved_viz_type} requires params_json.groupby (or columns)."
+            )
+
+    if resolved_viz_type in {"line", "area"}:
+        if _is_missing(_value("metrics")):
+            raise ValueError(f"{resolved_viz_type} requires params_json.metrics.")
+
+    if resolved_viz_type == "box_plot":
+        if _is_missing(_value("metrics")):
+            raise ValueError("box_plot requires params_json.metrics.")
+        has_dimension = not _is_missing(_value("groupby")) or not _is_missing(_value("columns"))
+        if not has_dimension:
+            raise ValueError("box_plot requires params_json.groupby (or columns).")
+
+    if resolved_viz_type == "treemap":
+        if _is_missing(_value("metrics")):
+            raise ValueError("treemap requires params_json.metrics.")
+        if _is_missing(_value("groupby")):
+            raise ValueError("treemap requires params_json.groupby.")
+
+    if resolved_viz_type == "sunburst":
+        if _is_missing(_value("metrics")):
+            raise ValueError("sunburst requires params_json.metrics.")
+        if _is_missing(_value("groupby")) and _is_missing(_value("columns")):
+            raise ValueError("sunburst requires params_json.groupby (or columns).")
+
+    if resolved_viz_type == "funnel":
+        if _is_missing(_value("metrics")):
+            raise ValueError("funnel requires params_json.metrics.")
+        if _is_missing(_value("groupby")) and _is_missing(_value("columns")):
+            raise ValueError("funnel requires params_json.groupby (or columns).")
+
+    if resolved_viz_type == "gauge_chart":
+        if _is_missing(_value("metrics")):
+            raise ValueError("gauge_chart requires params_json.metrics.")
+
+    if resolved_viz_type in {"bubble", "bubble_v2"}:
+        if _is_missing(_value("x")):
+            raise ValueError(f"{resolved_viz_type} requires params_json.x.")
+        if _is_missing(_value("y")):
+            raise ValueError(f"{resolved_viz_type} requires params_json.y.")
+        if _is_missing(_value("size")):
+            raise ValueError(f"{resolved_viz_type} requires params_json.size.")
+
     if dataset_columns and referenced_columns:
         missing = sorted(
             col
@@ -471,6 +541,51 @@ def validate_params_json(params_json: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Pre-delete export (mandatory, blocking)
 # ---------------------------------------------------------------------------
+
+
+def _env_int(key: str, default: int) -> int:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+SNAPSHOT_MAX_AGE_DAYS = _env_int("PRESET_MCP_SNAPSHOT_MAX_AGE_DAYS", 30)
+
+
+def prune_old_snapshots(
+    max_age_days: int | None = None,
+) -> int:
+    """Delete snapshot files older than *max_age_days*.
+
+    Returns the number of files removed.  Non-blocking: logs and swallows
+    errors for individual files so a single corrupt entry never blocks
+    the caller.
+    """
+    age = max_age_days if max_age_days is not None else SNAPSHOT_MAX_AGE_DAYS
+    if age <= 0:
+        return 0
+
+    snap_dir = AUDIT_DIR / "snapshots"
+    if not snap_dir.exists():
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=age)
+    removed = 0
+    for snap_file in snap_dir.glob("*.json"):
+        try:
+            mtime = datetime.fromtimestamp(snap_file.stat().st_mtime, tz=timezone.utc)
+            if mtime < cutoff:
+                snap_file.unlink()
+                removed += 1
+        except Exception as exc:
+            _log.warning("prune_old_snapshots: could not remove %s: %s", snap_file, exc)
+    if removed:
+        _log.info("pruned %d old snapshot files (max_age_days=%d)", removed, age)
+    return removed
 
 
 def export_before_delete(

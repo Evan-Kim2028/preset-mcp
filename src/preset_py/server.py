@@ -50,6 +50,7 @@ from preset_py._safety import (
     capture_before,
     check_dataset_dependents,
     export_before_delete,
+    prune_old_snapshots,
     record_mutation,
     validate_params_payload,
 )
@@ -3348,7 +3349,7 @@ def snapshot_workspace() -> str:
 
 
 # ===================================================================
-# Tools — Local audit visibility + dashboard recovery
+# Tools — Local audit visibility + resource recovery
 # ===================================================================
 
 
@@ -3358,6 +3359,7 @@ def _read_mutation_entries(
     resource_type: str | None = None,
     resource_id: int | None = None,
     tool_name: str | None = None,
+    action: str | None = None,
 ) -> list[dict[str, Any]]:
     journal = AUDIT_DIR / "mutations.jsonl"
     if not journal.exists():
@@ -3380,6 +3382,8 @@ def _read_mutation_entries(
             continue
         if tool_name and entry.get("tool_name") != tool_name:
             continue
+        if action and entry.get("action") != action:
+            continue
         entries.append(entry)
 
     entries.sort(key=lambda item: str(item.get("timestamp", "")), reverse=True)
@@ -3392,9 +3396,20 @@ def list_mutations(
     resource_type: Literal["dashboard", "chart", "dataset"] | None = None,
     resource_id: int | None = None,
     tool_name: str | None = None,
+    action: Literal["create", "update", "delete", "restore"] | None = None,
     limit: int = 50,
 ) -> str:
-    """List recent local mutation-journal entries for incident debugging."""
+    """List recent local mutation-journal entries for incident debugging.
+
+    All filters are optional and combine with AND logic.
+
+    Args:
+        resource_type: Filter by resource type
+        resource_id: Filter by specific resource ID
+        tool_name: Filter by the MCP tool that triggered the mutation
+        action: Filter by mutation action (create, update, delete, restore)
+        limit: Maximum entries to return (1-500, default 50)
+    """
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500.")
 
@@ -3403,6 +3418,7 @@ def list_mutations(
         resource_type=resource_type,
         resource_id=resource_id,
         tool_name=tool_name,
+        action=action,
     )
     return json.dumps({
         "count": len(entries),
@@ -3410,7 +3426,85 @@ def list_mutations(
         "resource_type": resource_type,
         "resource_id": resource_id,
         "tool_name": tool_name,
+        "action": action,
         "entries": entries,
+    }, indent=2, default=str)
+
+
+def _list_snapshots_for_type(
+    resource_type: str,
+    resource_id: int | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """List snapshot files for a given resource type, optionally filtered by ID."""
+    snap_dir = AUDIT_DIR / "snapshots"
+    if not snap_dir.exists():
+        return []
+
+    if resource_id is None:
+        pattern = f"{resource_type}_*.json"
+    else:
+        pattern = f"{resource_type}_{resource_id}_*.json"
+
+    files = sorted(
+        snap_dir.glob(pattern),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    records: list[dict[str, Any]] = []
+    for snap in files[:limit]:
+        stem_parts = snap.stem.split("_")
+        snap_resource_id = _to_int(stem_parts[1]) if len(stem_parts) >= 3 else None
+        timestamp_token = "_".join(stem_parts[2:]) if len(stem_parts) >= 3 else None
+        records.append({
+            "snapshot_path": str(snap),
+            "resource_type": resource_type,
+            "resource_id": snap_resource_id,
+            "timestamp_token": timestamp_token,
+            "size_bytes": snap.stat().st_size,
+            "modified_at": datetime.fromtimestamp(
+                snap.stat().st_mtime, tz=timezone.utc
+            ).isoformat(),
+        })
+    return records
+
+
+@mcp.tool()
+@_handle_errors
+def list_snapshots(
+    resource_type: Literal["dashboard", "chart", "dataset"] | None = None,
+    resource_id: int | None = None,
+    limit: int = 50,
+) -> str:
+    """List locally saved pre-mutation snapshots.
+
+    Snapshots are automatically captured before every mutation (create,
+    update, delete). Use the snapshot_path from the results with the
+    matching restore tool to recover a previous state.
+
+    Args:
+        resource_type: Filter by type ('dashboard', 'chart', 'dataset').
+                       If None, shows snapshots for all types.
+        resource_id: Filter by specific resource ID
+        limit: Maximum entries to return (1-500, default 50)
+    """
+    if limit < 1 or limit > 500:
+        raise ValueError("limit must be between 1 and 500.")
+
+    if resource_type is not None:
+        records = _list_snapshots_for_type(resource_type, resource_id, limit)
+    else:
+        records = []
+        for rtype in ("dashboard", "chart", "dataset"):
+            records.extend(_list_snapshots_for_type(rtype, resource_id, limit))
+        records.sort(key=lambda r: r.get("modified_at", ""), reverse=True)
+        records = records[:limit]
+
+    return json.dumps({
+        "count": len(records),
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "snapshots": records,
     }, indent=2, default=str)
 
 
@@ -3420,39 +3514,14 @@ def list_dashboard_snapshots(
     dashboard_id: int | None = None,
     limit: int = 50,
 ) -> str:
-    """List locally saved dashboard snapshots captured before mutations."""
+    """List locally saved dashboard snapshots captured before mutations.
+
+    Convenience alias for list_snapshots(resource_type='dashboard').
+    """
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500.")
 
-    snap_dir = AUDIT_DIR / "snapshots"
-    if not snap_dir.exists():
-        return json.dumps({
-            "count": 0,
-            "dashboard_id": dashboard_id,
-            "snapshots": [],
-        }, indent=2, default=str)
-
-    pattern = "dashboard_*.json" if dashboard_id is None else f"dashboard_{dashboard_id}_*.json"
-    files = sorted(
-        snap_dir.glob(pattern),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    records: list[dict[str, Any]] = []
-    for snap in files[:limit]:
-        stem_parts = snap.stem.split("_")
-        snap_dashboard_id = _to_int(stem_parts[1]) if len(stem_parts) >= 3 else None
-        timestamp_token = stem_parts[2] if len(stem_parts) >= 3 else None
-        records.append({
-            "snapshot_path": str(snap),
-            "dashboard_id": snap_dashboard_id,
-            "timestamp_token": timestamp_token,
-            "size_bytes": snap.stat().st_size,
-            "modified_at": datetime.fromtimestamp(
-                snap.stat().st_mtime, tz=timezone.utc
-            ).isoformat(),
-        })
-
+    records = _list_snapshots_for_type("dashboard", dashboard_id, limit)
     return json.dumps({
         "count": len(records),
         "dashboard_id": dashboard_id,
@@ -3460,18 +3529,8 @@ def list_dashboard_snapshots(
     }, indent=2, default=str)
 
 
-@mcp.tool()
-@_handle_errors
-def restore_dashboard_snapshot(
-    dashboard_id: int,
-    snapshot_path: str,
-    restore_json_metadata: bool = True,
-    dry_run: bool = False,
-) -> str:
-    """Restore dashboard layout/settings from a local snapshot JSON file."""
-    ws = _get_ws()
-    _require_dashboards_exist(ws, [dashboard_id])
-
+def _read_snapshot_file(snapshot_path: str) -> dict[str, Any]:
+    """Read and validate a snapshot JSON file. Raises ValueError on problems."""
     path = Path(snapshot_path).expanduser()
     if not path.exists():
         raise ValueError(f"Snapshot not found: {snapshot_path}")
@@ -3484,6 +3543,34 @@ def restore_dashboard_snapshot(
     if not isinstance(snapshot, dict):
         raise ValueError("Snapshot file must contain a JSON object.")
 
+    return snapshot
+
+
+@mcp.tool()
+@_handle_errors
+def restore_dashboard_snapshot(
+    dashboard_id: int,
+    snapshot_path: str,
+    restore_json_metadata: bool = True,
+    validate_chart_refs: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """Restore dashboard layout/settings from a local snapshot JSON file.
+
+    Args:
+        dashboard_id: ID of the dashboard to restore
+        snapshot_path: Path to the snapshot file (from list_snapshots)
+        restore_json_metadata: Also restore json_metadata (filter config,
+                               default chart sizes, etc.) (default: True)
+        validate_chart_refs: Check that chart IDs in the snapshot layout
+                             still exist in the workspace (default: True)
+        dry_run: Preview without applying changes (default: False)
+    """
+    ws = _get_ws()
+    _require_dashboards_exist(ws, [dashboard_id])
+
+    snapshot = _read_snapshot_file(snapshot_path)
+
     snap_dashboard_id = _to_int(snapshot.get("id"))
     if snap_dashboard_id is not None and snap_dashboard_id != dashboard_id:
         raise ValueError(
@@ -3493,6 +3580,23 @@ def restore_dashboard_snapshot(
 
     restored_position = _ensure_json_dict(snapshot.get("position_json"), "position_json")
     _validate_position_layout(restored_position)
+
+    # P2: Validate chart references in the restored layout still exist
+    warnings: list[str] = []
+    if validate_chart_refs and restored_position:
+        snapshot_chart_ids = _layout_chart_ids(restored_position)
+        if snapshot_chart_ids:
+            try:
+                current_charts = {ch.get("id") for ch in ws.charts()}
+                missing_charts = sorted(snapshot_chart_ids - current_charts)
+                if missing_charts:
+                    warnings.append(
+                        f"Snapshot layout references chart IDs that no longer exist: "
+                        f"{missing_charts}. These will appear as empty placeholders."
+                    )
+            except Exception as exc:
+                warnings.append(f"Could not validate chart references: {exc}")
+
     kwargs: dict[str, Any] = {
         "position_json": json.dumps(restored_position),
     }
@@ -3501,6 +3605,13 @@ def restore_dashboard_snapshot(
         kwargs["json_metadata"] = json.dumps(restored_metadata)
 
     before = capture_before(ws, "dashboard", dashboard_id)
+
+    result_extras: dict[str, Any] = {
+        "_restored_from_snapshot": str(Path(snapshot_path).expanduser()),
+    }
+    if warnings:
+        result_extras["_warnings"] = warnings
+
     return _do_mutation(
         tool_name="restore_dashboard_snapshot",
         resource_type="dashboard",
@@ -3511,17 +3622,190 @@ def restore_dashboard_snapshot(
         resource_id=dashboard_id,
         before=before,
         preview_extras={
-            "snapshot_path": str(path),
+            "snapshot_path": str(Path(snapshot_path).expanduser()),
             "restore_json_metadata": restore_json_metadata,
+            "_warnings": warnings if warnings else None,
         },
-        result_extras={
-            "_restored_from_snapshot": str(path),
-        },
+        result_extras=result_extras,
         after_extras={
-            "snapshot_path": str(path),
+            "snapshot_path": str(Path(snapshot_path).expanduser()),
             "restore_json_metadata": restore_json_metadata,
         },
     )
+
+
+@mcp.tool()
+@_handle_errors
+def restore_chart_snapshot(
+    chart_id: int,
+    snapshot_path: str,
+    restore_params: bool = True,
+    restore_viz_type: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """Restore a chart's parameters and viz type from a local snapshot.
+
+    Captures are made automatically before every chart mutation. Use
+    list_snapshots(resource_type='chart') to find available snapshots.
+
+    Args:
+        chart_id: ID of the chart to restore
+        snapshot_path: Path to the snapshot file (from list_snapshots)
+        restore_params: Restore the chart params/form_data (default: True)
+        restore_viz_type: Restore the viz_type (default: True)
+        dry_run: Preview without applying changes (default: False)
+    """
+    ws = _get_ws()
+    _require_chart_exists(ws, chart_id)
+
+    snapshot = _read_snapshot_file(snapshot_path)
+
+    snap_chart_id = _to_int(snapshot.get("id"))
+    if snap_chart_id is not None and snap_chart_id != chart_id:
+        raise ValueError(
+            f"Snapshot chart id {snap_chart_id} does not match requested "
+            f"chart_id {chart_id}."
+        )
+
+    kwargs: dict[str, Any] = {}
+
+    if restore_params:
+        params = snapshot.get("params")
+        if params is not None:
+            if isinstance(params, dict):
+                kwargs["params"] = json.dumps(params)
+            elif isinstance(params, str):
+                kwargs["params"] = params
+
+    if restore_viz_type:
+        viz_type = snapshot.get("viz_type")
+        if isinstance(viz_type, str) and viz_type:
+            kwargs["viz_type"] = viz_type
+
+    if not kwargs:
+        raise ValueError(
+            "Snapshot does not contain restorable chart fields (params, viz_type)."
+        )
+
+    before = capture_before(ws, "chart", chart_id)
+    return _do_mutation(
+        tool_name="restore_chart_snapshot",
+        resource_type="chart",
+        action="update",
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        execute=lambda: ws.update_chart(chart_id, **kwargs),
+        resource_id=chart_id,
+        before=before,
+        preview_extras={
+            "snapshot_path": str(Path(snapshot_path).expanduser()),
+            "restore_params": restore_params,
+            "restore_viz_type": restore_viz_type,
+        },
+        result_extras={
+            "_restored_from_snapshot": str(Path(snapshot_path).expanduser()),
+        },
+        after_extras={
+            "snapshot_path": str(Path(snapshot_path).expanduser()),
+        },
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def restore_dataset_snapshot(
+    dataset_id: int,
+    snapshot_path: str,
+    restore_sql: bool = True,
+    restore_description: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """Restore a dataset's SQL and description from a local snapshot.
+
+    Captures are made automatically before every dataset mutation. Use
+    list_snapshots(resource_type='dataset') to find available snapshots.
+
+    Args:
+        dataset_id: ID of the dataset to restore
+        snapshot_path: Path to the snapshot file (from list_snapshots)
+        restore_sql: Restore the SQL query (default: True)
+        restore_description: Restore the description (default: True)
+        dry_run: Preview without applying changes (default: False)
+    """
+    ws = _get_ws()
+    _require_dataset_exists(ws, dataset_id)
+
+    snapshot = _read_snapshot_file(snapshot_path)
+
+    snap_dataset_id = _to_int(snapshot.get("id"))
+    if snap_dataset_id is not None and snap_dataset_id != dataset_id:
+        raise ValueError(
+            f"Snapshot dataset id {snap_dataset_id} does not match requested "
+            f"dataset_id {dataset_id}."
+        )
+
+    kwargs: dict[str, Any] = {}
+
+    if restore_sql:
+        sql = snapshot.get("sql")
+        if isinstance(sql, str) and sql.strip():
+            kwargs["sql"] = sql
+
+    if restore_description:
+        description = snapshot.get("description")
+        if isinstance(description, str):
+            kwargs["description"] = description
+
+    table_name = snapshot.get("table_name")
+    if isinstance(table_name, str) and table_name:
+        kwargs["table_name"] = table_name
+
+    if not kwargs:
+        raise ValueError(
+            "Snapshot does not contain restorable dataset fields (sql, description, table_name)."
+        )
+
+    before = capture_before(ws, "dataset", dataset_id)
+    return _do_mutation(
+        tool_name="restore_dataset_snapshot",
+        resource_type="dataset",
+        action="update",
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        execute=lambda: ws.update_dataset(dataset_id, **kwargs),
+        resource_id=dataset_id,
+        before=before,
+        preview_extras={
+            "snapshot_path": str(Path(snapshot_path).expanduser()),
+            "restore_sql": restore_sql,
+            "restore_description": restore_description,
+        },
+        result_extras={
+            "_restored_from_snapshot": str(Path(snapshot_path).expanduser()),
+        },
+        after_extras={
+            "snapshot_path": str(Path(snapshot_path).expanduser()),
+        },
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def prune_snapshots(
+    max_age_days: int | None = None,
+) -> str:
+    """Remove old snapshot files to reclaim disk space.
+
+    Args:
+        max_age_days: Delete snapshots older than this many days.
+                      Defaults to PRESET_MCP_SNAPSHOT_MAX_AGE_DAYS (30).
+    """
+    removed = prune_old_snapshots(max_age_days=max_age_days)
+    return json.dumps({
+        "status": "ok",
+        "snapshots_removed": removed,
+        "max_age_days": max_age_days,
+    }, indent=2)
 
 
 # ===================================================================
