@@ -394,6 +394,49 @@ def _coerce_list_arg(
     return normalized
 
 
+def _is_timeout_exception(exc: Exception) -> bool:
+    """Best-effort classification for timeout-shaped post-validation failures."""
+    type_name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return (
+        isinstance(exc, TimeoutError)
+        or "timeout" in type_name
+        or "timed out" in message
+        or "timeout" in message
+    )
+
+
+def _post_validation_result(
+    ws: PresetWorkspace,
+    *,
+    chart_id: int,
+    dashboard_id: int | None,
+    operation_name: str,
+    operation_past_tense: str,
+) -> dict[str, Any]:
+    """Run post-mutation validation without losing the mutated chart id."""
+    try:
+        return ws.validate_chart_data(
+            chart_id,
+            dashboard_id=dashboard_id,
+        )
+    except Exception as exc:
+        timed_out = _is_timeout_exception(exc)
+        status = "timeout" if timed_out else "post_validation_failed"
+        outcome = "timed out" if timed_out else "failed"
+        return {
+            "chart_id": chart_id,
+            "status": status,
+            "error_type": type(exc).__name__,
+            "error": (
+                f"Post-{operation_name} validation {outcome} "
+                f"({type(exc).__name__}: {exc}). "
+                f"The chart was {operation_past_tense} successfully. "
+                "Use get_chart to inspect it and rerun validate_chart when ready."
+            ),
+        }
+
+
 def _dataset_columns(dataset: dict[str, Any]) -> set[str]:
     columns = dataset.get("columns", [])
     if not isinstance(columns, list):
@@ -2950,9 +2993,12 @@ def create_chart(
 
     if validate_after_create:
         dashboard_id = dashboards_list[0] if dashboards_list else None
-        payload["_validation"] = ws.validate_chart_data(
-            chart_id,
+        payload["_validation"] = _post_validation_result(
+            ws,
+            chart_id=chart_id,
             dashboard_id=dashboard_id,
+            operation_name="creation",
+            operation_past_tense="created",
         )
     return json.dumps(payload, indent=2, default=str)
 
@@ -3127,6 +3173,31 @@ def update_chart(
                 "be a complete viz-compatible params payload, not a partial patch."
             ) from exc
 
+        try:
+            existing_params = (
+                _ensure_json_dict(before.get("params", {}), "chart params")
+                if before.get("params")
+                else {}
+            )
+        except ValueError:
+            existing_params = {}
+            _log.debug(
+                "update_chart: could not parse existing params for chart %s; "
+                "skipping datasource metadata preservation",
+                chart_id,
+            )
+        parsed_params = json.loads(params_json)
+        if isinstance(parsed_params, dict):
+            if (
+                "datasource" not in parsed_params
+                and "datasource" in existing_params
+            ):
+                parsed_params["datasource"] = existing_params["datasource"]
+            resolved_viz_type = viz_type or before.get("viz_type")
+            if "viz_type" not in parsed_params and resolved_viz_type:
+                parsed_params["viz_type"] = resolved_viz_type
+            params_json = json.dumps(parsed_params)
+
     kwargs: dict[str, Any] = {}
     if title is not None:
         kwargs["slice_name"] = title
@@ -3161,9 +3232,12 @@ def update_chart(
 
     if validate_after_update:
         dashboard_id = dashboards_list[0] if dashboards_list else None
-        payload["_validation"] = ws.validate_chart_data(
-            chart_id,
+        payload["_validation"] = _post_validation_result(
+            ws,
+            chart_id=chart_id,
             dashboard_id=dashboard_id,
+            operation_name="update",
+            operation_past_tense="updated",
         )
     return json.dumps(payload, indent=2, default=str)
 

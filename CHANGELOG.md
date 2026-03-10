@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.0 - 2026-03-10
+
+### Fixed
+- Pie chart creation/update now sets the singular `metric` value needed by
+  Superset chart-data backends that derive `orderby` from `metric` rather than
+  `metrics`.
+- Dashboard layout validation now rejects malformed `position_json` nodes that
+  are missing required `id` / `type` fields or whose node ids do not match
+  their dictionary keys.
+- `update_chart(params_json=...)` now preserves the existing datasource binding
+  and `viz_type` metadata when callers replace the params payload, preventing
+  standalone charts from becoming unverifiable after updates.
+- `create_chart(validate_after_create=True)` and
+  `update_chart(validate_after_update=True)` now return partial-success
+  validation payloads when follow-up validation times out or fails after the
+  mutation already succeeded, so callers keep the resulting chart id and error
+  details.
+
+### Added
+- Added `describe_dashboard` for one-call dashboard summarization covering
+  metadata, markdown blocks, chart inventory, dataset inventory, and optional
+  upstream source-table lineage.
+
+### Quality
+- Added regression coverage for malformed layout validation, dashboard
+  description output, datasource-preserving chart updates, and post-mutation
+  validation timeout/error handling.
+
 ## 0.6.0 - 2026-03-04
 
 ### Fixed
