@@ -1030,3 +1030,177 @@ def test_describe_dashboard_compact(monkeypatch) -> None:
     payload = json.loads(raw)
     assert payload["chart_count"] == 0
     assert payload["dataset_count"] == 0
+
+
+# ===================================================================
+# Issue #30 — update_chart preserves datasource; create_chart timeout
+# ===================================================================
+
+
+def test_update_chart_preserves_datasource_binding(monkeypatch) -> None:
+    """update_chart should inject existing datasource key into new params."""
+    captured_kwargs: dict = {}
+
+    class _WS(_WorkspaceBase):
+        def chart_detail(self, chart_id: int):
+            return {
+                "id": chart_id,
+                "viz_type": "pie",
+                "datasource_id": 42,
+                "params": json.dumps({
+                    "datasource": "42__table",
+                    "viz_type": "pie",
+                    "metrics": ["count"],
+                    "groupby": ["CHAIN"],
+                }),
+            }
+
+        def get_resource(self, resource_type: str, resource_id: int):
+            return self.chart_detail(resource_id)
+
+        def dataset_detail(self, dataset_id: int):
+            return {
+                "id": dataset_id,
+                "columns": [{"column_name": "CHAIN"}],
+                "metrics": [{"metric_name": "count"}],
+            }
+
+        def update_chart(self, chart_id: int, **kwargs):
+            captured_kwargs.update(kwargs)
+            return {"id": chart_id, "result": "ok"}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    server.update_chart.fn(
+        chart_id=1,
+        params_json=json.dumps({
+            "metrics": ["count"],
+            "groupby": ["CHAIN"],
+        }),
+        validate_after_update=False,
+    )
+
+    updated_params = json.loads(captured_kwargs["params"])
+    assert updated_params["datasource"] == "42__table"
+    assert updated_params["viz_type"] == "pie"
+
+
+def test_update_chart_does_not_overwrite_user_datasource(monkeypatch) -> None:
+    """If user explicitly provides datasource in params_json, keep it."""
+    captured_kwargs: dict = {}
+
+    class _WS(_WorkspaceBase):
+        def chart_detail(self, chart_id: int):
+            return {
+                "id": chart_id,
+                "viz_type": "pie",
+                "datasource_id": 42,
+                "params": json.dumps({
+                    "datasource": "42__table",
+                    "viz_type": "pie",
+                    "metrics": ["count"],
+                    "groupby": ["CHAIN"],
+                }),
+            }
+
+        def get_resource(self, resource_type: str, resource_id: int):
+            return self.chart_detail(resource_id)
+
+        def dataset_detail(self, dataset_id: int):
+            return {
+                "id": dataset_id,
+                "columns": [{"column_name": "CHAIN"}],
+                "metrics": [{"metric_name": "count"}],
+            }
+
+        def update_chart(self, chart_id: int, **kwargs):
+            captured_kwargs.update(kwargs)
+            return {"id": chart_id, "result": "ok"}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    server.update_chart.fn(
+        chart_id=1,
+        params_json=json.dumps({
+            "datasource": "42__table",
+            "metrics": ["count"],
+            "groupby": ["CHAIN"],
+        }),
+        validate_after_update=False,
+    )
+
+    updated_params = json.loads(captured_kwargs["params"])
+    assert updated_params["datasource"] == "42__table"
+
+
+def test_create_chart_returns_id_on_validation_timeout(monkeypatch) -> None:
+    """create_chart should return chart ID even if post-validation times out."""
+
+    class _WS(_WorkspaceBase):
+        def dataset_detail(self, dataset_id: int):
+            return {
+                "id": dataset_id,
+                "columns": [
+                    {"column_name": "CHAIN", "type": "VARCHAR"},
+                    {"column_name": "AMOUNT", "type": "NUMERIC"},
+                ],
+                "metrics": [{"metric_name": "count"}],
+            }
+
+        def create_chart(self, dataset_id: int, title: str, viz_type: str, **kwargs):
+            return {"id": 77, "slice_name": title, "viz_type": viz_type}
+
+        def validate_chart_data(self, chart_id: int, **kwargs):
+            raise TimeoutError("Connection timed out after 120s")
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.create_chart.fn(
+        dataset_id=10,
+        title="Test Chart",
+        viz_type="table",
+        metrics='["count"]',
+        groupby='["CHAIN"]',
+        validate_after_create=True,
+    )
+    payload = json.loads(raw)
+    assert payload["id"] == 77
+    assert payload["_validation"]["status"] == "timeout"
+    assert "created successfully" in payload["_validation"]["error"]
+
+
+def test_update_chart_returns_result_on_validation_timeout(monkeypatch) -> None:
+    """update_chart should return result even if post-validation times out."""
+
+    class _WS(_WorkspaceBase):
+        def chart_detail(self, chart_id: int):
+            return {
+                "id": chart_id,
+                "viz_type": "table",
+                "datasource_id": 10,
+                "params": json.dumps({"datasource": "10__table"}),
+            }
+
+        def get_resource(self, resource_type: str, resource_id: int):
+            return self.chart_detail(resource_id)
+
+        def update_chart(self, chart_id: int, **kwargs):
+            return {"id": chart_id, "result": "ok"}
+
+        def validate_chart_data(self, chart_id: int, **kwargs):
+            raise TimeoutError("Connection timed out after 120s")
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.update_chart.fn(
+        chart_id=1,
+        title="New Title",
+        validate_after_update=True,
+    )
+    payload = json.loads(raw)
+    assert payload["_validation"]["status"] == "timeout"
+    assert "updated successfully" in payload["_validation"]["error"]

@@ -2950,10 +2950,20 @@ def create_chart(
 
     if validate_after_create:
         dashboard_id = dashboards_list[0] if dashboards_list else None
-        payload["_validation"] = ws.validate_chart_data(
-            chart_id,
-            dashboard_id=dashboard_id,
-        )
+        try:
+            payload["_validation"] = ws.validate_chart_data(
+                chart_id,
+                dashboard_id=dashboard_id,
+            )
+        except Exception as exc:
+            payload["_validation"] = {
+                "chart_id": chart_id,
+                "status": "timeout",
+                "error": (
+                    f"Post-creation validation failed ({type(exc).__name__}: {exc}). "
+                    "The chart was created successfully — use get_chart to verify."
+                ),
+            }
     return json.dumps(payload, indent=2, default=str)
 
 
@@ -3127,6 +3137,19 @@ def update_chart(
                 "be a complete viz-compatible params payload, not a partial patch."
             ) from exc
 
+    # Preserve datasource binding: inject existing datasource/viz_type
+    # keys into the new params so the chart remains valid after update.
+    if params_json is not None:
+        existing_params = _ensure_json_dict(before.get("params", {}), "chart params") if before.get("params") else {}
+        new_params = json.loads(params_json)
+        if isinstance(new_params, dict):
+            if "datasource" not in new_params and "datasource" in existing_params:
+                new_params["datasource"] = existing_params["datasource"]
+            resolved = viz_type or before.get("viz_type")
+            if "viz_type" not in new_params and resolved:
+                new_params["viz_type"] = resolved
+            params_json = json.dumps(new_params)
+
     kwargs: dict[str, Any] = {}
     if title is not None:
         kwargs["slice_name"] = title
@@ -3161,10 +3184,20 @@ def update_chart(
 
     if validate_after_update:
         dashboard_id = dashboards_list[0] if dashboards_list else None
-        payload["_validation"] = ws.validate_chart_data(
-            chart_id,
-            dashboard_id=dashboard_id,
-        )
+        try:
+            payload["_validation"] = ws.validate_chart_data(
+                chart_id,
+                dashboard_id=dashboard_id,
+            )
+        except Exception as exc:
+            payload["_validation"] = {
+                "chart_id": chart_id,
+                "status": "timeout",
+                "error": (
+                    f"Post-update validation failed ({type(exc).__name__}: {exc}). "
+                    "The chart was updated successfully — use get_chart to verify."
+                ),
+            }
     return json.dumps(payload, indent=2, default=str)
 
 
