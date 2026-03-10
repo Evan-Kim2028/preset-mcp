@@ -18,6 +18,7 @@ from preset_cli.api.clients.preset import PresetClient
 from preset_cli.api.clients.superset import SupersetClient
 
 from preset_py.snapshot import WorkspaceSnapshot, take_snapshot
+from preset_py._viz_specs import VIZ_SPECS, TIMESERIES_VIZ_TYPES, validate_chart_envelope
 
 PRESET_API_URL = "https://api.app.preset.io/"
 
@@ -241,55 +242,58 @@ def _apply_chart_defaults(
     *,
     template: Literal["auto", "minimal"] = "auto",
 ) -> None:
-    """Apply sane defaults so minimal chart inputs become renderable."""
+    """Apply sane defaults so minimal chart inputs become renderable.
+
+    Driven by ``VIZ_SPECS`` — the canonical per-viz-type spec registry.
+    """
     if template == "minimal":
         return
 
-    if viz_type == "pie":
-        params.setdefault("show_legend", True)
-        params.setdefault("labels_outside", True)
-        if not _coerce_list(params.get("metrics")):
-            params["metrics"] = [_default_metric(dataset)]
-        # Backward-compat: some Superset builds derive orderby from the
-        # singular ``metric`` field.  Always set it from the first entry
-        # in ``metrics`` so the query serializer never produces a null
-        # sort column (see GitHub issue #26).
+    spec = VIZ_SPECS.get(viz_type)
+    if spec is None:
+        # Unknown viz type — nothing to default.
+        return
+
+    # Static defaults from the spec (e.g. show_legend, labels_outside).
+    for key, value in spec.defaults.items():
+        params.setdefault(key, value)
+
+    # Auto-fill metrics from the dataset when absent.
+    if spec.auto_metrics and not _coerce_list(params.get("metrics")):
+        params["metrics"] = [_default_metric(dataset)]
+
+    # Singular metric backward-compat (GitHub issue #26).
+    if spec.needs_singular_metric:
         metrics_list = _coerce_list(params.get("metrics"))
         if metrics_list and "metric" not in params:
             params["metric"] = metrics_list[0]
-        if not _coerce_list(params.get("groupby")) and not _coerce_list(params.get("columns")):
+
+    # Auto-fill dimension (groupby / columns).
+    if spec.auto_dimension:
+        has_dimension = (
+            _coerce_list(params.get("groupby"))
+            or _coerce_list(params.get("columns"))
+        )
+        if not has_dimension:
             dimension = _default_dimension_column(dataset)
-            if not dimension:
+            if spec.needs_dimension and not dimension:
                 raise ValueError(
-                    "Could not infer a groupby dimension for pie chart. "
+                    f"Could not infer a groupby dimension for {viz_type} chart. "
                     "Pass groupby explicitly."
                 )
-            params["groupby"] = [dimension]
-        return
+            if dimension:
+                # Pie-style charts use groupby; table uses columns.
+                target = "groupby" if spec.needs_dimension else "columns"
+                params[target] = [dimension]
 
-    if viz_type in {"echarts_timeseries_bar", "echarts_timeseries_line", "echarts_timeseries_area"}:
-        if not _coerce_list(params.get("metrics")):
-            params["metrics"] = [_default_metric(dataset)]
+    # Time column inference for timeseries viz types.
+    if spec.needs_time_column:
         if not params.get("granularity_sqla"):
             inferred_time = _default_time_column(dataset)
             if inferred_time:
                 params["granularity_sqla"] = inferred_time
-        if params.get("granularity_sqla"):
-            params.setdefault("time_grain_sqla", "P1D")
-        return
-
-    if viz_type == "big_number_total":
-        if not _coerce_list(params.get("metrics")):
-            params["metrics"] = [_default_metric(dataset)]
-        return
-
-    if viz_type == "table":
-        if not _coerce_list(params.get("metrics")):
-            params["metrics"] = [_default_metric(dataset)]
-        if not _coerce_list(params.get("columns")) and not _coerce_list(params.get("groupby")):
-            dimension = _default_dimension_column(dataset)
-            if dimension:
-                params["columns"] = [dimension]
+        if params.get("granularity_sqla") and spec.auto_time_grain:
+            params.setdefault("time_grain_sqla", spec.auto_time_grain)
 
 
 def _validate_groupby_columns(groupby: list[str], dataset: dict[str, Any]) -> None:
@@ -353,6 +357,15 @@ def _create_chart(
     }
     if dashboards:
         payload["dashboards"] = dashboards
+
+    # Pre-mutation envelope validation — catch structural issues before
+    # the request reaches Superset (Phase 2 of architecture review).
+    envelope_errors = validate_chart_envelope(payload, viz_type)
+    if envelope_errors:
+        raise ValueError(
+            "Chart payload failed pre-mutation validation: "
+            + "; ".join(envelope_errors)
+        )
 
     return client.create_resource("chart", **payload)
 

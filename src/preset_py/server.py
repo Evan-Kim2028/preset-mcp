@@ -52,7 +52,9 @@ from preset_py._safety import (
     export_before_delete,
     record_mutation,
     validate_params_payload,
+    validate_position_layout,
 )
+from preset_py._viz_specs import validate_chart_envelope
 
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via PRESET_MCP_* env vars)
@@ -636,75 +638,11 @@ def _layout_chart_ids(position_json: Any) -> set[int]:
 
 
 def _validate_position_layout(position_json: dict[str, Any]) -> None:
-    """Preflight-check dashboard layout structure for common invalid shapes."""
-    if not position_json:
-        return
+    """Preflight-check dashboard layout structure for common invalid shapes.
 
-    missing = [node for node in ("ROOT_ID", "GRID_ID") if node not in position_json]
-    if missing:
-        raise ValueError(
-            "position_json is missing required nodes: "
-            f"{missing}. Expected at least ROOT_ID and GRID_ID."
-        )
-
-    root = position_json.get("ROOT_ID")
-    grid = position_json.get("GRID_ID")
-    if not isinstance(root, dict) or not isinstance(grid, dict):
-        raise ValueError("position_json ROOT_ID and GRID_ID must be JSON objects.")
-
-    root_children = root.get("children")
-    if not isinstance(root_children, list) or "GRID_ID" not in [
-        str(child) for child in root_children
-    ]:
-        raise ValueError(
-            "position_json ROOT_ID.children must include GRID_ID."
-        )
-
-    for node_id, node in position_json.items():
-        if node_id == "DASHBOARD_VERSION_KEY":
-            continue
-        if not isinstance(node, dict):
-            continue
-
-        # Every layout node must carry an ``id`` that matches its key
-        # and a ``type`` string so the Preset frontend can render it
-        # (see GitHub issue #27).
-        node_id_field = node.get("id")
-        if node_id_field is None:
-            raise ValueError(
-                f"position_json[{node_id!r}] is missing required 'id' field. "
-                "Every layout node must include an 'id' matching its key."
-            )
-        if str(node_id_field) != node_id:
-            raise ValueError(
-                f"position_json[{node_id!r}].id is {node_id_field!r} but must "
-                f"match the node key {node_id!r}."
-            )
-        if not isinstance(node.get("type"), str) or not node.get("type"):
-            raise ValueError(
-                f"position_json[{node_id!r}] is missing required 'type' field."
-            )
-
-        children = node.get("children")
-        if children is None:
-            children = []
-        if not isinstance(children, list):
-            raise ValueError(
-                f"position_json[{node_id!r}].children must be a list."
-            )
-        for child in children:
-            child_id = str(child)
-            if child_id not in position_json:
-                raise ValueError(
-                    "position_json has dangling child reference: "
-                    f"{node_id!r} -> {child_id!r}."
-                )
-
-        parents = node.get("parents")
-        if parents is not None and not isinstance(parents, list):
-            raise ValueError(
-                f"position_json[{node_id!r}].parents must be a list when provided."
-            )
+    Delegates to the shared implementation in ``_safety.validate_position_layout``.
+    """
+    validate_position_layout(position_json)
 
 
 _TEMPLATE_DROP_COMMON_KEYS = frozenset({

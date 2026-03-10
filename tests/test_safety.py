@@ -52,7 +52,7 @@ def test_params_payload_rejects_metric_dimension_label_collision() -> None:
 
 
 def test_params_payload_enforces_pie_required_fields() -> None:
-    with pytest.raises(ValueError, match="Pie charts require params_json.metrics"):
+    with pytest.raises(ValueError, match="pie.*requires.*metrics"):
         validate_params_payload(
             '{"groupby":["CHAIN"]}',
             dataset_columns={"CHAIN"},
@@ -60,7 +60,7 @@ def test_params_payload_enforces_pie_required_fields() -> None:
             viz_type="pie",
         )
 
-    with pytest.raises(ValueError, match="Pie charts require params_json.groupby"):
+    with pytest.raises(ValueError, match="pie.*requires.*groupby.*columns"):
         validate_params_payload(
             '{"metrics":["count"]}',
             dataset_columns={"CHAIN"},
@@ -78,7 +78,7 @@ def test_params_payload_pie_auto_sets_singular_metric() -> None:
         viz_type="pie",
     )
     assert parsed["metric"] == "count"
-    assert any("Auto-set" in w for w in warnings)
+    assert any("Auto-set" in w and "pie" in w for w in warnings)
 
 
 def test_params_payload_pie_preserves_explicit_metric() -> None:
@@ -94,7 +94,7 @@ def test_params_payload_pie_preserves_explicit_metric() -> None:
 
 
 def test_params_payload_enforces_timeseries_required_fields() -> None:
-    with pytest.raises(ValueError, match="requires params_json.metrics"):
+    with pytest.raises(ValueError, match="echarts_timeseries_line.*requires.*metrics"):
         validate_params_payload(
             '{"granularity_sqla":"DAY"}',
             dataset_columns={"DAY"},
@@ -102,7 +102,7 @@ def test_params_payload_enforces_timeseries_required_fields() -> None:
             viz_type="echarts_timeseries_line",
         )
 
-    with pytest.raises(ValueError, match="requires a time column"):
+    with pytest.raises(ValueError, match="echarts_timeseries_line.*requires a time column"):
         validate_params_payload(
             '{"metrics":["count"]}',
             dataset_columns={"DAY"},

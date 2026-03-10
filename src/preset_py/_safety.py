@@ -11,6 +11,8 @@ from typing import Any, Literal, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from preset_py._viz_specs import VIZ_SPECS, check_required_fields
+
 if TYPE_CHECKING:
     from preset_py.client import PresetWorkspace
 
@@ -398,53 +400,28 @@ def validate_params_payload(
             f"{metric_dimension_collisions}."
         )
 
-    def _is_missing(value: Any) -> bool:
-        if value is None:
-            return True
-        if isinstance(value, str):
-            return not value.strip()
-        if isinstance(value, (list, tuple, set, dict)):
-            return len(value) == 0
-        return False
-
-    def _value(key: str) -> Any:
-        if key in parsed:
-            return parsed.get(key)
-        return fallback_fields.get(key)
-
-    if resolved_viz_type == "pie":
-        if _is_missing(_value("metrics")):
-            raise ValueError("Pie charts require params_json.metrics.")
-        # Backward-compat: ensure singular ``metric`` is present so
-        # Superset backends that derive orderby from it never get null
-        # (see GitHub issue #26).
-        pie_metrics = _value("metrics")
-        if isinstance(pie_metrics, list) and pie_metrics and "metric" not in parsed:
-            parsed["metric"] = pie_metrics[0]
-            warnings.append(
-                "Auto-set params_json.metric from first metrics entry "
-                "for pie chart backward compatibility."
-            )
-        has_dimension = not _is_missing(_value("groupby")) or not _is_missing(_value("columns"))
-        if not has_dimension:
-            raise ValueError("Pie charts require params_json.groupby (or columns).")
-
-    if resolved_viz_type in {
-        "echarts_timeseries_bar",
-        "echarts_timeseries_line",
-        "echarts_timeseries_area",
-    }:
-        if _is_missing(_value("metrics")):
-            raise ValueError(f"{resolved_viz_type} requires params_json.metrics.")
-        has_time = not _is_missing(_value("granularity_sqla")) or not _is_missing(_value("time_column"))
-        if not has_time:
+    # -- Spec-driven viz-type validation (replaces per-type if/else) --------
+    if resolved_viz_type:
+        field_errors = check_required_fields(
+            resolved_viz_type, parsed, fallback_fields=fallback_fields,
+        )
+        if field_errors:
             raise ValueError(
-                f"{resolved_viz_type} requires a time column "
-                "(granularity_sqla or time_column)."
+                f"params_json validation failed for {resolved_viz_type}: "
+                + "; ".join(field_errors)
             )
 
-    if resolved_viz_type == "big_number_total" and _is_missing(_value("metrics")):
-        raise ValueError("big_number_total requires params_json.metrics.")
+        # Backward-compat: auto-set singular ``metric`` for viz types that
+        # need it (e.g. pie — see GitHub issue #26).
+        spec = VIZ_SPECS.get(resolved_viz_type)
+        if spec and spec.needs_singular_metric:
+            metrics_value = parsed.get("metrics")
+            if isinstance(metrics_value, list) and metrics_value and "metric" not in parsed:
+                parsed["metric"] = metrics_value[0]
+                warnings.append(
+                    "Auto-set params_json.metric from first metrics entry "
+                    f"for {resolved_viz_type} backward compatibility."
+                )
 
     if dataset_columns and referenced_columns:
         missing = sorted(
@@ -489,3 +466,81 @@ def export_before_delete(
 
     _log.info("pre-delete export saved: %s (%d bytes)", export_path, len(zip_bytes))
     return export_path
+
+
+# ---------------------------------------------------------------------------
+# Dashboard layout (position_json) validation
+# ---------------------------------------------------------------------------
+
+
+def validate_position_layout(position_json: dict[str, Any]) -> None:
+    """Preflight-check dashboard layout structure for common invalid shapes.
+
+    Raises ``ValueError`` with a descriptive message on structural problems.
+    Extracted from server.py so it can be reused as a pre-mutation guard.
+    """
+    if not position_json:
+        return
+
+    missing = [node for node in ("ROOT_ID", "GRID_ID") if node not in position_json]
+    if missing:
+        raise ValueError(
+            "position_json is missing required nodes: "
+            f"{missing}. Expected at least ROOT_ID and GRID_ID."
+        )
+
+    root = position_json.get("ROOT_ID")
+    grid = position_json.get("GRID_ID")
+    if not isinstance(root, dict) or not isinstance(grid, dict):
+        raise ValueError("position_json ROOT_ID and GRID_ID must be JSON objects.")
+
+    root_children = root.get("children")
+    if not isinstance(root_children, list) or "GRID_ID" not in [
+        str(child) for child in root_children
+    ]:
+        raise ValueError(
+            "position_json ROOT_ID.children must include GRID_ID."
+        )
+
+    for node_id, node in position_json.items():
+        if node_id == "DASHBOARD_VERSION_KEY":
+            continue
+        if not isinstance(node, dict):
+            continue
+
+        node_id_field = node.get("id")
+        if node_id_field is None:
+            raise ValueError(
+                f"position_json[{node_id!r}] is missing required 'id' field. "
+                "Every layout node must include an 'id' matching its key."
+            )
+        if str(node_id_field) != node_id:
+            raise ValueError(
+                f"position_json[{node_id!r}].id is {node_id_field!r} but must "
+                f"match the node key {node_id!r}."
+            )
+        if not isinstance(node.get("type"), str) or not node.get("type"):
+            raise ValueError(
+                f"position_json[{node_id!r}] is missing required 'type' field."
+            )
+
+        children = node.get("children")
+        if children is None:
+            children = []
+        if not isinstance(children, list):
+            raise ValueError(
+                f"position_json[{node_id!r}].children must be a list."
+            )
+        for child in children:
+            child_id = str(child)
+            if child_id not in position_json:
+                raise ValueError(
+                    "position_json has dangling child reference: "
+                    f"{node_id!r} -> {child_id!r}."
+                )
+
+        parents = node.get("parents")
+        if parents is not None and not isinstance(parents, list):
+            raise ValueError(
+                f"position_json[{node_id!r}].parents must be a list when provided."
+            )
