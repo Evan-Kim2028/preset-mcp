@@ -30,6 +30,7 @@ class _FakeSupersetClient:
     def __init__(self, response: _FakeResponse):
         self.baseurl = URL("https://example.preset.io")
         self.session = _FakeSession(response)
+        self.update_chart_calls: list[dict] = []
 
     def get_dataset(self, _dataset_id: int):
         return {
@@ -41,6 +42,10 @@ class _FakeSupersetClient:
             ],
             "metrics": [],
         }
+
+    def update_chart(self, chart_id: int, **kwargs):
+        self.update_chart_calls.append({"chart_id": chart_id, **kwargs})
+        return {"id": chart_id, "result": "ok"}
 
 
 def _workspace_with(
@@ -248,3 +253,85 @@ def test_validate_chart_translates_orderby_null_errors() -> None:
 
     assert result["status"] == "request_failed"
     assert "invalid metric key" in str(result["error"])
+
+
+def test_validate_chart_persists_synthetic_query_context_when_requested() -> None:
+    """Issue #35: synthetic query_context should be written back to the chart."""
+    chart = {
+        "id": 5,
+        "slice_name": "Persist QC Chart",
+        "query_context": None,
+        "datasource_id": 42,
+        "datasource_type": "table",
+        "params": json.dumps(
+            {
+                "datasource": "42__table",
+                "groupby": ["TOKEN"],
+                "metrics": ["count"],
+            }
+        ),
+    }
+    response = _FakeResponse(
+        200,
+        {"result": [{"status": "success", "error": None, "rowcount": 3, "cache_key": "x"}]},
+    )
+    ws, client = _workspace_with(chart=chart, form_data=None, response=response)
+
+    result = ws.validate_chart_data(5, dashboard_id=None, persist_synthetic=True)
+
+    assert result["status"] == "success"
+    assert result["payload_source"] == "synthetic.form_data"
+    assert len(client.update_chart_calls) == 1
+    call = client.update_chart_calls[0]
+    assert call["chart_id"] == 5
+    persisted = json.loads(call["query_context"])
+    assert "datasource" in persisted
+    assert persisted["datasource"]["id"] == 42
+    assert "queries" in persisted
+    assert isinstance(persisted["queries"], list)
+    assert len(persisted["queries"]) == 1
+
+
+def test_validate_chart_does_not_persist_when_persist_synthetic_false() -> None:
+    """Default behavior: no update_chart call when persist_synthetic is False."""
+    chart = {
+        "id": 6,
+        "slice_name": "No Persist Chart",
+        "query_context": None,
+        "datasource_id": 42,
+        "datasource_type": "table",
+        "params": json.dumps({"datasource": "42__table", "groupby": ["TOKEN"], "metrics": ["count"]}),
+    }
+    response = _FakeResponse(
+        200,
+        {"result": [{"status": "success", "error": None, "rowcount": 1, "cache_key": "y"}]},
+    )
+    ws, client = _workspace_with(chart=chart, form_data=None, response=response)
+
+    ws.validate_chart_data(6, dashboard_id=None, persist_synthetic=False)
+
+    assert client.update_chart_calls == []
+
+
+def test_validate_chart_does_not_persist_when_existing_query_context_used() -> None:
+    """When chart already has query_context, no update_chart call should be made."""
+    chart = {
+        "id": 7,
+        "slice_name": "Real QC Chart",
+        "query_context": json.dumps(
+            {
+                "datasource": {"id": 42, "type": "table"},
+                "queries": [{"columns": ["TOKEN"], "metrics": [], "row_limit": 1000}],
+            }
+        ),
+        "params": json.dumps({"datasource": "42__table"}),
+    }
+    response = _FakeResponse(
+        200,
+        {"result": [{"status": "success", "error": None, "rowcount": 2, "cache_key": "z"}]},
+    )
+    ws, client = _workspace_with(chart=chart, form_data=None, response=response)
+
+    ws.validate_chart_data(7, dashboard_id=None, persist_synthetic=True)
+
+    assert client.update_chart_calls == []
