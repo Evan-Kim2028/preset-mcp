@@ -419,6 +419,7 @@ def _post_validation_result(
         return ws.validate_chart_data(
             chart_id,
             dashboard_id=dashboard_id,
+            persist_synthetic=True,
         )
     except Exception as exc:
         timed_out = _is_timeout_exception(exc)

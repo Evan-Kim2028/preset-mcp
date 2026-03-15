@@ -896,6 +896,7 @@ class PresetWorkspace:
         dashboard_id: int | None = None,
         row_limit: int = 10000,
         force: bool = False,
+        persist_synthetic: bool = False,
     ) -> dict[str, Any]:
         """Execute chart query context and return render-status data.
 
@@ -1116,6 +1117,18 @@ class PresetWorkspace:
                 overall_status = "failed"
                 if first_error is None:
                     first_error = error or f"query[{idx}] returned status {status!r}"
+
+        if persist_synthetic and payload_source == "synthetic.form_data":
+            persist_qc = {
+                "datasource": payload["datasource"],
+                "queries": payload["queries"],
+            }
+            try:
+                self.update_chart(chart_id, query_context=json.dumps(persist_qc))
+            except Exception:
+                _log.debug(
+                    "Could not persist synthetic query_context for chart %s", chart_id
+                )
 
         return {
             "chart_id": chart_id,
