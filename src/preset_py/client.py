@@ -396,7 +396,7 @@ def _as_int(value: Any) -> int | None:
     if value is None:
         return None
     if isinstance(value, bool):
-        return int(value)
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, str) and value.strip().isdigit():

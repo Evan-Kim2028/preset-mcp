@@ -31,6 +31,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from difflib import get_close_matches
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -471,23 +472,6 @@ def _dataset_metrics(dataset: dict[str, Any]) -> set[str]:
     return names
 
 
-def _require_dataset_exists(ws: PresetWorkspace, dataset_id: int) -> None:
-    try:
-        ws.dataset_detail(dataset_id)
-    except Exception as exc:
-        raise ValueError(
-            f"Dataset {dataset_id} not found. Use list_datasets to find valid IDs."
-        ) from exc
-
-
-def _require_chart_exists(ws: PresetWorkspace, chart_id: int) -> None:
-    try:
-        ws.chart_detail(chart_id)
-    except Exception as exc:
-        raise ValueError(
-            f"Chart {chart_id} not found. Use list_charts to find valid IDs."
-        ) from exc
-
 
 def _require_database_exists(ws: PresetWorkspace, database_id: int) -> None:
     try:
@@ -882,9 +866,9 @@ def _dashboard_structure_report(
                     })
 
     reachable: set[str] = set()
-    queue: list[str] = ["ROOT_ID"] if "ROOT_ID" in nodes else []
+    queue: deque[str] = deque(["ROOT_ID"] if "ROOT_ID" in nodes else [])
     while queue:
-        current = queue.pop(0)
+        current = queue.popleft()
         if current in reachable:
             continue
         reachable.add(current)
@@ -1532,7 +1516,7 @@ def list_dashboards(
 @_handle_errors
 def get_dashboard(
     dashboard_id: int,
-    response_mode: ResponseMode = "full",
+    response_mode: ResponseMode = "standard",
 ) -> str:
     """Get detail for a single dashboard.
 
@@ -1543,8 +1527,9 @@ def get_dashboard(
     Args:
         dashboard_id: Numeric dashboard ID
         response_mode: 'compact' (id+title), 'standard' (key fields, no
-                       position_json), or 'full' (raw API response).
-                       Default: full.
+                       position_json), or 'full' (raw API response
+                       including position_json and json_metadata).
+                       Default: standard.
     """
     ws = _get_ws()
     result = ws.dashboard_detail(dashboard_id)
@@ -1568,7 +1553,7 @@ def get_dashboard(
 @_handle_errors
 def get_chart(
     chart_id: int,
-    response_mode: ResponseMode = "full",
+    response_mode: ResponseMode = "standard",
 ) -> str:
     """Get detail for a single chart including params and query context.
 
@@ -1578,8 +1563,9 @@ def get_chart(
 
     Args:
         chart_id: Numeric chart ID
-        response_mode: 'compact' (id+name+viz_type), 'standard' (key fields),
-                       or 'full' (raw API response).  Default: full.
+        response_mode: 'compact' (id+name+viz_type), 'standard' (key fields
+                       including params), or 'full' (raw API response).
+                       Default: standard.
     """
     ws = _get_ws()
     result = _enrich_chart_datasource_fields(ws, ws.chart_detail(chart_id))
@@ -1590,7 +1576,7 @@ def get_chart(
 @_handle_errors
 def get_dataset(
     dataset_id: int,
-    response_mode: ResponseMode = "full",
+    response_mode: ResponseMode = "standard",
     refresh_columns: bool = False,
 ) -> str:
     """Get detail for a single dataset including columns, metrics, and SQL.
@@ -1603,7 +1589,7 @@ def get_dataset(
         dataset_id: Numeric dataset ID
         response_mode: 'compact' (id+name+schema), 'standard' (columns,
                        metrics, sql), or 'full' (raw API response).
-                       Default: full.
+                       Default: standard.
         refresh_columns: If True, also fetch live column metadata from the
                          source database and include as 'external_columns'.
     """
@@ -1618,7 +1604,7 @@ def get_dataset(
 @_handle_errors
 def get_database(
     database_id: int,
-    response_mode: ResponseMode = "full",
+    response_mode: ResponseMode = "standard",
 ) -> str:
     """Get detail for a single database connection.
 
@@ -1627,7 +1613,7 @@ def get_database(
     Args:
         database_id: Numeric database ID
         response_mode: 'compact' (id+name+backend), 'standard' (key fields),
-                       or 'full' (raw API response).  Default: full.
+                       or 'full' (raw API response).  Default: standard.
     """
     ws = _get_ws()
     result = ws.database_detail(database_id)
@@ -2699,13 +2685,15 @@ def capture_golden_templates(
                 })
                 continue
             path.write_text(json.dumps(template, indent=2, default=str) + "\n")
-            saved.append({
+            entry: dict[str, Any] = {
                 "dashboard_id": dashboard_id,
                 "title": title,
                 "chart_count": len(template.get("charts", [])),
                 "structure_status": template.get("dashboard", {}).get("structure_report", {}).get("status"),
                 "output_path": str(path),
-            })
+            }
+            entry["_structure_report"] = template.get("dashboard", {}).get("structure_report")
+            saved.append(entry)
         except Exception as exc:
             failures.append({
                 "dashboard_id": dashboard_id,
@@ -2732,8 +2720,12 @@ def capture_golden_templates(
         }, indent=2, default=str)
 
     if response_mode == "standard":
+        # Strip verbose structure reports for standard mode
+        for item in payload.get("saved", []):
+            item.pop("_structure_report", None)
         return json.dumps(payload, indent=2, default=str)
 
+    # full: include per-dashboard structure reports
     return json.dumps(payload, indent=2, default=str)
 
 
@@ -2861,8 +2853,12 @@ def create_chart(
                  making any changes (default: False)
     """
     ws = _get_ws()
-    _require_dataset_exists(ws, dataset_id)
-    dataset = ws.dataset_detail(dataset_id)
+    try:
+        dataset = ws.dataset_detail(dataset_id)
+    except Exception as exc:
+        raise ValueError(
+            f"Dataset {dataset_id} not found. Use list_datasets to find valid IDs."
+        ) from exc
     _validate_viz_type(ws, viz_type)
     if template not in ("auto", "minimal"):
         raise ValueError("template must be one of: auto, minimal.")
@@ -3051,8 +3047,11 @@ def update_dataset(
         )
 
     ws = _get_ws()
-    _require_dataset_exists(ws, dataset_id)
     before = capture_before(ws, "dataset", dataset_id)
+    if "_snapshot_error" in before:
+        raise ValueError(
+            f"Dataset {dataset_id} not found. Use list_datasets to find valid IDs."
+        )
 
     # Dependency check when SQL changes or columns are overridden
     dependency_impact: dict[str, Any] | None = None
@@ -3127,8 +3126,11 @@ def update_chart(
                  (default: False)
     """
     ws = _get_ws()
-    _require_chart_exists(ws, chart_id)
     before = capture_before(ws, "chart", chart_id)
+    if "_snapshot_error" in before:
+        raise ValueError(
+            f"Chart {chart_id} not found. Use list_charts to find valid IDs."
+        )
 
     chart_dataset_id = _to_int(before.get("datasource_id"))
     if chart_dataset_id is None:
@@ -3257,7 +3259,8 @@ def update_dashboard(
     """Update an existing dashboard's properties.
 
     Use list_dashboards to find the dashboard_id.
-    Use get_dashboard to inspect the current position_json and json_metadata.
+    Use get_dashboard(response_mode='full') to inspect the current
+    position_json and json_metadata (these are excluded from 'standard').
 
     Args:
         dashboard_id: ID of the dashboard to update

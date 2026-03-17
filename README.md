@@ -160,7 +160,7 @@ get_dashboard(dashboard_id=80, response_mode="standard")
 → key fields only, no position_json or json_metadata blobs
 ```
 
-Detail tools (`get_dashboard`, `get_chart`, `get_dataset`, `get_database`) default to `full` for backward compatibility. Use `standard` or `compact` to avoid large payloads — dashboards with 20+ charts can return 50-100K chars in full mode.
+Detail tools (`get_dashboard`, `get_chart`, `get_dataset`, `get_database`) default to `standard` for token efficiency. Use `full` when you need raw API fields (e.g. `position_json` on dashboards) or `compact` for minimal discovery.
 
 ### SQL Safety
 
@@ -250,7 +250,7 @@ Notes:
 
 - `update_chart(params_json=...)` uses strict validation semantics and treats `params_json` as a full viz-compatible params payload.
 - For viz types with required fields (for example `pie` and timeseries charts), partial payloads like only `{"color_scheme":"..."}` are rejected.
-- Use `get_chart(chart_id=<id>, response_mode="full")` to copy/edit the existing params JSON when you need precise updates.
+- Use `get_chart(chart_id=<id>)` to copy/edit the existing params JSON when you need precise updates (`standard` mode includes `params`).
 
 ## Golden Template Workflow
 
