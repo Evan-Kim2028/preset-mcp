@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,8 @@ from preset_cli.api.clients.preset import PresetClient
 from preset_cli.api.clients.superset import SupersetClient
 
 from preset_py.snapshot import WorkspaceSnapshot, take_snapshot
+
+_log = logging.getLogger("preset-mcp")
 
 PRESET_API_URL = "https://api.app.preset.io/"
 
@@ -871,10 +874,15 @@ class PresetWorkspace:
         self,
         chart_id: int,
         dashboard_id: int | None = None,
+        _dashboard_charts: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any] | None, int | None]:
-        """Return form_data for a chart from a specific dashboard or auto-scan all."""
+        """Return form_data for a chart from a specific dashboard or auto-scan all.
+
+        Pass ``_dashboard_charts`` to reuse a pre-fetched chart list and avoid
+        a redundant API call to the dashboard charts endpoint.
+        """
         if dashboard_id is not None:
-            charts = self.dashboard_charts(dashboard_id)
+            charts = _dashboard_charts if _dashboard_charts is not None else self.dashboard_charts(dashboard_id)
             for chart in charts:
                 if chart.get("id") == chart_id:
                     return chart.get("form_data", {}), dashboard_id
@@ -897,18 +905,22 @@ class PresetWorkspace:
         row_limit: int = 10000,
         force: bool = False,
         persist_synthetic: bool = False,
+        _dashboard_charts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Execute chart query context and return render-status data.
 
         Returns a normalized dict with query status + errors. This validates chart
         parameter integrity (missing metrics/columns/filters) without waiting for
         full dashboard rendering.
+
+        Pass ``_dashboard_charts`` to reuse a pre-fetched chart list and avoid
+        redundant dashboard charts API calls.
         """
         chart = self.get_resource("chart", chart_id)
         sheet_name = chart.get("slice_name") or chart.get("name") or f"chart-{chart_id}"
 
         form_data, resolved_dashboard_id = self.chart_form_data(
-            chart_id, dashboard_id=dashboard_id
+            chart_id, dashboard_id=dashboard_id, _dashboard_charts=_dashboard_charts
         )
         form_data_source = "dashboard.form_data"
         if not isinstance(form_data, dict):
@@ -1168,7 +1180,10 @@ class PresetWorkspace:
             cid = chart.get("id")
             if isinstance(cid, int):
                 results.append(
-                    self.validate_chart_data(cid, dashboard_id=dashboard_id, row_limit=row_limit, force=force)
+                    self.validate_chart_data(
+                        cid, dashboard_id=dashboard_id, row_limit=row_limit,
+                        force=force, _dashboard_charts=charts,
+                    )
                 )
         return {
             "dashboard_id": dashboard_id,
