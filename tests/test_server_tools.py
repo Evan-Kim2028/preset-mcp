@@ -11,6 +11,12 @@ class _WorkspaceBase:
     def charts(self):
         return [{"id": 1, "viz_type": "table"}]
 
+    def dashboards(self):
+        return [{"id": 1}, {"id": 80}]
+
+    def get_resource(self, resource_type: str, resource_id: int):
+        return {"id": resource_id}
+
 
 def _validation_payload(exc: ToolError) -> dict:
     return json.loads(str(exc))
@@ -81,7 +87,7 @@ def test_create_chart_accepts_json_array_strings_and_validates(monkeypatch) -> N
             self.create_kwargs = kwargs
             return {"id": 77, "slice_name": title, "viz_type": viz_type}
 
-        def validate_chart_data(self, chart_id: int, dashboard_id=None, row_limit=10000, force=False):
+        def validate_chart_data(self, chart_id: int, dashboard_id=None, row_limit=10000, force=False, **kwargs):
             return {
                 "chart_id": chart_id,
                 "dashboard_id": dashboard_id,
@@ -208,8 +214,8 @@ def test_create_chart_rejects_invalid_dashboard_id(monkeypatch) -> None:
         def dataset_detail(self, dataset_id: int):
             return {"id": dataset_id}
 
-        def dashboard_detail(self, dashboard_id: int):
-            raise RuntimeError("not found")
+        def dashboards(self):
+            return [{"id": 1}]
 
     monkeypatch.setattr(server, "_get_ws", lambda: _WS())
     with pytest.raises(ToolError) as exc:
@@ -221,7 +227,8 @@ def test_create_chart_rejects_invalid_dashboard_id(monkeypatch) -> None:
             dry_run=True,
         )
     payload = _validation_payload(exc.value)
-    assert "Dashboard 123 not found" in payload["error"]
+    assert "123" in payload["error"]
+    assert "not found" in payload["error"]
 
 
 def test_create_chart_default_does_not_repair_dashboard_refs(monkeypatch) -> None:
@@ -229,6 +236,9 @@ def test_create_chart_default_does_not_repair_dashboard_refs(monkeypatch) -> Non
         def __init__(self) -> None:
             self.dashboard_detail_calls = 0
             self.updated_dashboard = False
+
+        def dashboards(self):
+            return [{"id": 123}]
 
         def dataset_detail(self, dataset_id: int):
             return {
@@ -266,7 +276,7 @@ def test_create_chart_default_does_not_repair_dashboard_refs(monkeypatch) -> Non
     payload = json.loads(raw)
 
     assert payload["id"] == 77
-    assert ws.dashboard_detail_calls == 1  # only precondition check
+    assert ws.dashboard_detail_calls == 0  # batch check via dashboards(), no detail calls
     assert ws.updated_dashboard is False
 
 

@@ -471,21 +471,13 @@ def _dataset_metrics(dataset: dict[str, Any]) -> set[str]:
     return names
 
 
-def _require_dataset_exists(ws: PresetWorkspace, dataset_id: int) -> None:
+def _fetch_dataset_or_raise(ws: PresetWorkspace, dataset_id: int) -> dict[str, Any]:
+    """Fetch dataset detail, raising ValueError if not found."""
     try:
-        ws.dataset_detail(dataset_id)
+        return ws.dataset_detail(dataset_id)
     except Exception as exc:
         raise ValueError(
             f"Dataset {dataset_id} not found. Use list_datasets to find valid IDs."
-        ) from exc
-
-
-def _require_chart_exists(ws: PresetWorkspace, chart_id: int) -> None:
-    try:
-        ws.chart_detail(chart_id)
-    except Exception as exc:
-        raise ValueError(
-            f"Chart {chart_id} not found. Use list_charts to find valid IDs."
         ) from exc
 
 
@@ -499,16 +491,33 @@ def _require_database_exists(ws: PresetWorkspace, database_id: int) -> None:
 
 
 def _require_dashboards_exist(ws: PresetWorkspace, dashboard_ids: list[int]) -> None:
-    for dashboard_id in dashboard_ids:
-        try:
-            ws.dashboard_detail(dashboard_id)
-        except Exception as exc:
-            raise ValueError(
-                f"Dashboard {dashboard_id} not found. Use list_dashboards to find valid IDs."
-            ) from exc
+    """Validate that all dashboard IDs exist using a single listing call."""
+    known_ids = {
+        _to_int(d.get("id"))
+        for d in ws.dashboards()
+        if _to_int(d.get("id")) is not None
+    }
+    missing = [did for did in dashboard_ids if did not in known_ids]
+    if missing:
+        raise ValueError(
+            f"Dashboard(s) {missing} not found. Use list_dashboards to find valid IDs."
+        )
+
+
+_viz_type_cache: dict[str, tuple[set[str], float]] = {}
+_VIZ_TYPE_CACHE_TTL = 300  # seconds
 
 
 def _collect_workspace_viz_types(ws: PresetWorkspace) -> set[str]:
+    import time
+
+    cache_key = str(getattr(ws, "workspace_url", None) or "default")
+    cached = _viz_type_cache.get(cache_key)
+    if cached is not None:
+        viz_types, cached_at = cached
+        if time.monotonic() - cached_at < _VIZ_TYPE_CACHE_TTL:
+            return viz_types
+
     viz_types = set(_KNOWN_VIZ_TYPES)
     try:
         for chart in ws.charts():
@@ -518,6 +527,7 @@ def _collect_workspace_viz_types(ws: PresetWorkspace) -> set[str]:
     except Exception:
         # Non-blocking fallback to curated defaults.
         pass
+    _viz_type_cache[cache_key] = (viz_types, time.monotonic())
     return viz_types
 
 
@@ -597,7 +607,9 @@ def _enrich_chart_datasource_fields(ws: PresetWorkspace, chart: dict[str, Any]) 
         if not ds_type:
             ds_type = type_from_qc
 
-    if ds_name is None or ds_id is None or not ds_type:
+    if ds_id is None or not ds_type:
+        # Only scan the full chart listing when we're missing critical fields
+        # (datasource_id or datasource_type). Skip if we only need the name.
         try:
             chart_id = _to_int(enriched.get("id"))
             if chart_id is not None:
@@ -2861,8 +2873,7 @@ def create_chart(
                  making any changes (default: False)
     """
     ws = _get_ws()
-    _require_dataset_exists(ws, dataset_id)
-    dataset = ws.dataset_detail(dataset_id)
+    dataset = _fetch_dataset_or_raise(ws, dataset_id)
     _validate_viz_type(ws, viz_type)
     if template not in ("auto", "minimal"):
         raise ValueError("template must be one of: auto, minimal.")
@@ -3051,8 +3062,11 @@ def update_dataset(
         )
 
     ws = _get_ws()
-    _require_dataset_exists(ws, dataset_id)
     before = capture_before(ws, "dataset", dataset_id)
+    if "_snapshot_error" in before:
+        raise ValueError(
+            f"Dataset {dataset_id} not found. Use list_datasets to find valid IDs."
+        )
 
     # Dependency check when SQL changes or columns are overridden
     dependency_impact: dict[str, Any] | None = None
@@ -3127,8 +3141,11 @@ def update_chart(
                  (default: False)
     """
     ws = _get_ws()
-    _require_chart_exists(ws, chart_id)
     before = capture_before(ws, "chart", chart_id)
+    if "_snapshot_error" in before:
+        raise ValueError(
+            f"Chart {chart_id} not found. Use list_charts to find valid IDs."
+        )
 
     chart_dataset_id = _to_int(before.get("datasource_id"))
     if chart_dataset_id is None:
@@ -3358,13 +3375,16 @@ def repair_dashboard_chart_refs(
         dry_run: If True, preview detected changes without updating.
     """
     ws = _get_ws()
-    dashboard = ws.dashboard_detail(dashboard_id)
-    charts = ws.dashboard_charts(dashboard_id)
     before = capture_before(ws, "dashboard", dashboard_id)
+    if "_snapshot_error" in before:
+        raise ValueError(
+            f"Dashboard {dashboard_id} not found. Use list_dashboards to find valid IDs."
+        )
+    charts = ws.dashboard_charts(dashboard_id)
 
     position, metadata, summary = _repair_dashboard_refs(
-        dashboard.get("position_json", {}),
-        dashboard.get("json_metadata", {}),
+        before.get("position_json", {}),
+        before.get("json_metadata", {}),
         charts,
         strategy=strategy,
     )

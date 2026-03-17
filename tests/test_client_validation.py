@@ -59,7 +59,7 @@ def _workspace_with(
     ws = PresetWorkspace.__new__(PresetWorkspace)
     ws._superset = client
     ws.get_resource = lambda _rtype, _rid: chart
-    ws.chart_form_data = lambda _cid, dashboard_id=None: (form_data, dashboard_id or 162) if form_data is not None else (None, dashboard_id)
+    ws.chart_form_data = lambda _cid, dashboard_id=None, _dashboard_charts=None: (form_data, dashboard_id or 162) if form_data is not None else (None, dashboard_id)
     return ws, client
 
 
