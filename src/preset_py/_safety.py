@@ -11,6 +11,8 @@ from typing import Any, Literal, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from preset_py.client import _metric_column_name
+
 if TYPE_CHECKING:
     from preset_py.client import PresetWorkspace
 
@@ -157,17 +159,6 @@ _VIZ_DIMENSION_KEYS = (
     "time_column",
     "granularity_sqla",
 )
-
-def _metric_column_name(metric: dict[str, Any]) -> str | None:
-    """Extract a metric's referenced column name, if present."""
-    column = metric.get("column")
-    if isinstance(column, str):
-        return column
-    if isinstance(column, dict):
-        name = column.get("column_name") or column.get("name")
-        if isinstance(name, str):
-            return name
-    return None
 
 
 def _metric_label(metric: Any) -> str | None:
