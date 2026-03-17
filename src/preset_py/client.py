@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,8 @@ from preset_cli.api.clients.preset import PresetClient
 from preset_cli.api.clients.superset import SupersetClient
 
 from preset_py.snapshot import WorkspaceSnapshot, take_snapshot
+
+_log = logging.getLogger("preset-mcp")
 
 PRESET_API_URL = "https://api.app.preset.io/"
 
