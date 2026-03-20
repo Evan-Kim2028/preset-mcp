@@ -657,6 +657,88 @@ def _extract_position_chart_refs(position_json: Any) -> dict[str, int]:
     return refs
 
 
+def _find_duplicate_chart_placements(
+    position_json: Any,
+) -> list[dict[str, Any]]:
+    """Find chart IDs placed in multiple layout nodes."""
+    refs = _extract_position_chart_refs(position_json)
+    chart_to_nodes: dict[int, list[str]] = {}
+    for node_id, chart_id in refs.items():
+        chart_to_nodes.setdefault(chart_id, []).append(node_id)
+    return [
+        {"chart_id": chart_id, "layout_nodes": sorted(nodes)}
+        for chart_id, nodes in sorted(chart_to_nodes.items())
+        if len(nodes) > 1
+    ]
+
+
+def _deduplicate_layout_containers(position_json: dict[str, Any]) -> dict[str, Any]:
+    """Remove duplicate chart container nodes from a dashboard layout.
+
+    After a ZIP import, Superset may duplicate ROW/CHART containers.
+    This keeps the first occurrence of each chart_id (by sorted node key)
+    and prunes the duplicate nodes plus their parent references.
+    """
+    if not position_json:
+        return position_json
+
+    refs = _extract_position_chart_refs(position_json)
+    chart_to_nodes: dict[int, list[str]] = {}
+    for node_id, chart_id in refs.items():
+        chart_to_nodes.setdefault(chart_id, []).append(node_id)
+
+    nodes_to_remove: set[str] = set()
+    for chart_id, node_ids in chart_to_nodes.items():
+        if len(node_ids) <= 1:
+            continue
+        # Keep the first (sorted) node, remove the rest
+        for dup_node in sorted(node_ids)[1:]:
+            nodes_to_remove.add(dup_node)
+
+    if not nodes_to_remove:
+        return position_json
+
+    cleaned = dict(position_json)
+    for node_id in nodes_to_remove:
+        cleaned.pop(node_id, None)
+
+    # Remove references to deleted nodes from parent children lists
+    for node_id, node in cleaned.items():
+        if not isinstance(node, dict):
+            continue
+        children = node.get("children")
+        if isinstance(children, list):
+            filtered = [c for c in children if str(c) not in nodes_to_remove]
+            if len(filtered) != len(children):
+                node["children"] = filtered
+
+    # Prune empty wrapper rows that no longer have children
+    empty_wrappers: set[str] = set()
+    for node_id, node in list(cleaned.items()):
+        if not isinstance(node, dict):
+            continue
+        ntype = node.get("type", "")
+        if ntype in ("ROW", "COLUMN") and node.get("children") == []:
+            # Only remove if the wrapper is not ROOT_ID or GRID_ID
+            if node_id not in ("ROOT_ID", "GRID_ID"):
+                empty_wrappers.add(node_id)
+
+    for node_id in empty_wrappers:
+        cleaned.pop(node_id, None)
+
+    # Clean up parent references to removed wrappers
+    for node_id, node in cleaned.items():
+        if not isinstance(node, dict):
+            continue
+        children = node.get("children")
+        if isinstance(children, list):
+            filtered = [c for c in children if str(c) not in empty_wrappers]
+            if len(filtered) != len(children):
+                node["children"] = filtered
+
+    return cleaned
+
+
 def _extract_scope_chart_refs(json_metadata: Any) -> set[int]:
     payload = _ensure_json_dict(json_metadata, "json_metadata")
     charts_in_scope = payload.get("chartsInScope")
@@ -920,6 +1002,7 @@ def _dashboard_structure_report(
     }
     layout_chart_ids = set(_extract_position_chart_refs(position).values())
     scope_chart_ids = _extract_scope_chart_refs(metadata)
+    duplicate_chart_placements = _find_duplicate_chart_placements(position)
 
     layout_orphans = sorted(layout_chart_ids - attached_chart_ids)
     scope_orphans = sorted(scope_chart_ids - attached_chart_ids)
@@ -942,6 +1025,7 @@ def _dashboard_structure_report(
         or layout_orphans
         or scope_orphans
         or attached_missing_layout
+        or duplicate_chart_placements
     ):
         status = "warning"
 
@@ -963,6 +1047,7 @@ def _dashboard_structure_report(
         "layout_orphans": layout_orphans,
         "scope_orphans": scope_orphans,
         "attached_missing_layout": attached_missing_layout,
+        "duplicate_chart_placements": duplicate_chart_placements,
     }
 
 
@@ -2484,6 +2569,7 @@ def verify_dashboard_structure(
             "dangling_child_count": len(report.get("dangling_children", [])),
             "missing_id_count": len(report.get("missing_id_nodes", [])),
             "missing_type_count": len(report.get("missing_type_nodes", [])),
+            "duplicate_chart_count": len(report.get("duplicate_chart_placements", [])),
         }, indent=2, default=str)
 
     if response_mode == "standard":
@@ -2500,6 +2586,7 @@ def verify_dashboard_structure(
             "layout_orphans": report.get("layout_orphans"),
             "scope_orphans": report.get("scope_orphans"),
             "attached_missing_layout": report.get("attached_missing_layout"),
+            "duplicate_chart_placements": report.get("duplicate_chart_placements"),
         }, indent=2, default=str)
 
     return json.dumps({
@@ -3422,6 +3509,66 @@ def repair_dashboard_chart_refs(
     )
 
 
+@mcp.tool()
+@_handle_errors
+def repair_dashboard_layout_duplicates(
+    dashboard_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Remove duplicate chart container nodes from a dashboard layout.
+
+    After a ZIP import, Superset may duplicate ROW/CHART containers causing
+    charts to render twice.  This tool detects and removes the duplicates.
+
+    Args:
+        dashboard_id: Dashboard ID to repair
+        dry_run: If True, preview without mutating (default: False)
+    """
+    ws = _get_ws()
+    before = capture_before(ws, "dashboard", dashboard_id)
+    if "_snapshot_error" in before:
+        raise ValueError(
+            f"Dashboard {dashboard_id} not found. Use list_dashboards to find valid IDs."
+        )
+
+    position = _ensure_json_dict(before.get("position_json", {}), "position_json")
+    dupes = _find_duplicate_chart_placements(position)
+
+    if not dupes:
+        return json.dumps({
+            "status": "noop",
+            "dashboard_id": dashboard_id,
+            "duplicate_chart_placements": [],
+            "message": "No duplicate chart placements found.",
+        }, indent=2, default=str)
+
+    cleaned = _deduplicate_layout_containers(position)
+
+    return _do_mutation(
+        tool_name="repair_dashboard_layout_duplicates",
+        resource_type="dashboard",
+        action="update",
+        fields_changed=["position_json"],
+        dry_run=dry_run,
+        execute=lambda: ws.update_dashboard(
+            dashboard_id,
+            position_json=json.dumps(cleaned),
+        ),
+        resource_id=dashboard_id,
+        before=before,
+        preview_extras={
+            "duplicate_chart_placements": dupes,
+            "nodes_before": len(position),
+            "nodes_after": len(cleaned),
+        },
+        result_extras={
+            "duplicate_chart_placements_fixed": dupes,
+            "nodes_before": len(position),
+            "nodes_after": len(cleaned),
+        },
+    )
+
+
 # ===================================================================
 # Tools — Snapshot
 # ===================================================================
@@ -3561,9 +3708,20 @@ def restore_dashboard_snapshot(
     dashboard_id: int,
     snapshot_path: str,
     restore_json_metadata: bool = True,
+    allow_id_mismatch: bool = False,
     dry_run: bool = False,
 ) -> str:
-    """Restore dashboard layout/settings from a local snapshot JSON file."""
+    """Restore dashboard layout/settings from a local snapshot JSON file.
+
+    Args:
+        dashboard_id: Target dashboard to restore into.
+        snapshot_path: Path to snapshot JSON file.
+        restore_json_metadata: Whether to restore json_metadata too (default: True).
+        allow_id_mismatch: If True, allow restoring a snapshot taken from a
+            different dashboard ID into *dashboard_id*.  Useful when a dashboard
+            was deleted and re-imported with a new ID (default: False).
+        dry_run: If True, preview without mutating (default: False).
+    """
     ws = _get_ws()
     _require_dashboards_exist(ws, [dashboard_id])
 
@@ -3581,10 +3739,12 @@ def restore_dashboard_snapshot(
 
     snap_dashboard_id = _to_int(snapshot.get("id"))
     if snap_dashboard_id is not None and snap_dashboard_id != dashboard_id:
-        raise ValueError(
-            f"Snapshot dashboard id {snap_dashboard_id} does not match requested "
-            f"dashboard_id {dashboard_id}."
-        )
+        if not allow_id_mismatch:
+            raise ValueError(
+                f"Snapshot dashboard id {snap_dashboard_id} does not match requested "
+                f"dashboard_id {dashboard_id}. Pass allow_id_mismatch=True to "
+                f"restore this snapshot into a different dashboard."
+            )
 
     restored_position = _ensure_json_dict(snapshot.get("position_json"), "position_json")
     _validate_position_layout(restored_position)
@@ -3617,6 +3777,136 @@ def restore_dashboard_snapshot(
             "restore_json_metadata": restore_json_metadata,
         },
     )
+
+
+# ===================================================================
+# Tools — Dashboard Export / Import (always available)
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def export_dashboard(
+    dashboard_id: int,
+    output_path: str | None = None,
+) -> str:
+    """Export a dashboard as a ZIP bundle for backup or migration.
+
+    The ZIP contains the dashboard definition, its charts, and datasets.
+    If *output_path* is provided the ZIP is written to disk; otherwise it
+    is saved to the default audit exports directory.
+
+    Args:
+        dashboard_id: Dashboard to export
+        output_path: Optional file path to save the ZIP (default: auto)
+    """
+    ws = _get_ws()
+    _require_dashboards_exist(ws, [dashboard_id])
+
+    zip_bytes = ws.export_resource_zip("dashboard", [dashboard_id])
+
+    if output_path:
+        dest = Path(output_path).expanduser()
+    else:
+        exports_dir = AUDIT_DIR / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = exports_dir / f"dashboard_{dashboard_id}_{ts}.zip"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(zip_bytes)
+
+    record_mutation(MutationEntry(
+        tool_name="export_dashboard",
+        resource_type="dashboard",
+        resource_id=dashboard_id,
+        action="create",
+        after_summary={
+            "export_path": str(dest),
+            "size_bytes": len(zip_bytes),
+        },
+    ))
+
+    return json.dumps({
+        "status": "exported",
+        "dashboard_id": dashboard_id,
+        "export_path": str(dest),
+        "size_bytes": len(zip_bytes),
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def import_dashboard(
+    import_path: str,
+    overwrite: bool = False,
+    deduplicate_layout: bool = True,
+) -> str:
+    """Import a dashboard from a ZIP bundle.
+
+    Args:
+        import_path: Path to the ZIP file to import
+        overwrite: If True, overwrite existing dashboards with same IDs
+                   (default: False)
+        deduplicate_layout: If True, automatically fix duplicate chart
+                            containers that Superset may create during
+                            import (default: True)
+    """
+    ws = _get_ws()
+    path = Path(import_path).expanduser()
+    if not path.exists():
+        raise ValueError(f"Import file not found: {import_path}")
+
+    data = path.read_bytes()
+    result = ws.import_resource_zip("dashboard", data, overwrite=overwrite)
+
+    dedup_summary: dict[str, Any] | None = None
+    if deduplicate_layout and result:
+        dashboards = ws.dashboards()
+        for dash in dashboards:
+            dash_id = _to_int(dash.get("id"))
+            if dash_id is None:
+                continue
+            try:
+                detail = ws.dashboard_detail(dash_id)
+                pos = _ensure_json_dict(
+                    detail.get("position_json", {}), "position_json",
+                )
+                dupes = _find_duplicate_chart_placements(pos)
+                if dupes:
+                    cleaned = _deduplicate_layout_containers(pos)
+                    ws.update_dashboard(
+                        dash_id,
+                        position_json=json.dumps(cleaned),
+                    )
+                    dedup_summary = {
+                        "dashboard_id": dash_id,
+                        "duplicates_removed": len(dupes),
+                    }
+            except Exception:
+                pass  # best-effort dedup
+
+    record_mutation(MutationEntry(
+        tool_name="import_dashboard",
+        resource_type="dashboard",
+        action="create",
+        after_summary={
+            "import_path": str(path),
+            "overwrite": overwrite,
+            "success": result,
+            "dedup_applied": dedup_summary,
+        },
+    ))
+
+    response: dict[str, Any] = {
+        "status": "imported",
+        "import_path": str(path),
+        "overwrite": overwrite,
+        "success": result,
+    }
+    if dedup_summary:
+        response["layout_dedup"] = dedup_summary
+    return json.dumps(response, indent=2, default=str)
 
 
 # ===================================================================
@@ -3817,6 +4107,33 @@ if _DELETE_ENABLED:
             resource_type, export_path, overwrite,
         )
 
+        # Post-import deduplication for dashboards (fixes issue #39)
+        dedup_summary: dict[str, Any] | None = None
+        if resource_type == "dashboard" and result:
+            dashboards = ws.dashboards()
+            for dash in dashboards:
+                dash_id = _to_int(dash.get("id"))
+                if dash_id is None:
+                    continue
+                try:
+                    detail = ws.dashboard_detail(dash_id)
+                    pos = _ensure_json_dict(
+                        detail.get("position_json", {}), "position_json",
+                    )
+                    dupes = _find_duplicate_chart_placements(pos)
+                    if dupes:
+                        cleaned = _deduplicate_layout_containers(pos)
+                        ws.update_dashboard(
+                            dash_id,
+                            position_json=json.dumps(cleaned),
+                        )
+                        dedup_summary = {
+                            "dashboard_id": dash_id,
+                            "duplicates_removed": len(dupes),
+                        }
+                except Exception:
+                    pass  # best-effort dedup
+
         record_mutation(MutationEntry(
             tool_name="restore_from_backup",
             resource_type=resource_type,
@@ -3825,16 +4142,20 @@ if _DELETE_ENABLED:
                 "export_path": export_path,
                 "overwrite": overwrite,
                 "success": result,
+                "dedup_applied": dedup_summary,
             },
         ))
 
-        return json.dumps({
+        response: dict[str, Any] = {
             "status": "restored",
             "resource_type": resource_type,
             "export_path": export_path,
             "overwrite": overwrite,
             "success": result,
-        }, indent=2)
+        }
+        if dedup_summary:
+            response["layout_dedup"] = dedup_summary
+        return json.dumps(response, indent=2)
 
 
 # ===================================================================
