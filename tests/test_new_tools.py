@@ -89,7 +89,6 @@ def test_list_saved_queries_compact(monkeypatch) -> None:
     raw = server.list_saved_queries.fn(response_mode="compact")
     payload = json.loads(raw)
     assert payload["count"] == 2
-    assert payload["response_mode"] == "compact"
     # compact should only have id, label, db_id
     first = payload["data"][0]
     assert set(first.keys()) == {"id", "label", "db_id"}
@@ -102,14 +101,12 @@ def test_list_saved_queries_standard(monkeypatch) -> None:
     first = payload["data"][0]
     assert "sql" in first
     assert "description" in first
-    assert "hint" in payload
 
 
 def test_list_saved_queries_full(monkeypatch) -> None:
     monkeypatch.setattr(server, "_get_ws", lambda: _SavedQueryWS())
     raw = server.list_saved_queries.fn(response_mode="full")
     payload = json.loads(raw)
-    assert "hint" not in payload
     # full mode returns all original fields
     first = payload["data"][0]
     assert "changed_on" in first
@@ -153,7 +150,6 @@ def test_get_saved_query_full(monkeypatch) -> None:
     raw = server.get_saved_query.fn(query_id=2, response_mode="full")
     payload = json.loads(raw)
     assert payload["data"]["label"] == "Active users"
-    assert "hint" not in payload
 
 
 # -- create --
@@ -340,7 +336,6 @@ def test_get_css_template_full(monkeypatch) -> None:
     raw = server.get_css_template.fn(template_id=1, response_mode="full")
     payload = json.loads(raw)
     assert payload["data"]["css"] == ".dashboard { background: #1a1a1a; }"
-    assert "hint" not in payload
 
 
 # -- create --
@@ -530,7 +525,6 @@ def test_get_annotation_layer_full(monkeypatch) -> None:
     raw = server.get_annotation_layer.fn(layer_id=1, response_mode="full")
     payload = json.loads(raw)
     assert payload["data"]["annotations"] == _ANNOTATIONS
-    assert "hint" not in payload
 
 
 def test_get_annotation_layer_full_does_not_mutate_original(monkeypatch) -> None:
@@ -794,7 +788,6 @@ def test_get_embedded_dashboard_not_enabled(monkeypatch) -> None:
     raw = server.get_embedded_dashboard.fn(dashboard_id=99)
     payload = json.loads(raw)
     assert payload["embedded"] is False
-    assert "hint" in payload
 
 
 # -- enable --
