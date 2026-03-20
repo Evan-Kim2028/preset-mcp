@@ -198,12 +198,9 @@ def _format_list(
 
     out: dict[str, Any] = {
         "count": len(records),
-        "response_mode": mode,
         "data": data,
     }
-    if mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps(out, default=str)
 
 
 def _format_detail(record: dict, resource: str, mode: ResponseMode) -> str:
@@ -214,10 +211,7 @@ def _format_detail(record: dict, resource: str, mode: ResponseMode) -> str:
         data = {k: record[k] for k in _DETAIL_STANDARD.get(resource, []) if k in record}
     else:
         data = record
-    out: dict[str, Any] = {"response_mode": mode, "data": data}
-    if mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps({"data": data}, default=str)
 
 
 def _format_sql(
@@ -230,23 +224,15 @@ def _format_sql(
     out: dict[str, Any] = {
         "rowcount": total,
         "columns": columns,
-        "response_mode": mode,
     }
 
     if mode == "compact":
-        out["hint"] = (
-            "Schema only. Use response_mode='standard' for sample rows "
-            "or 'full' for all rows."
-        )
+        pass  # schema-only: columns + rowcount
     elif mode == "standard":
         sample = records[:SQL_SAMPLE_ROWS]
         out["sample_rows"] = sample
         if total > SQL_SAMPLE_ROWS:
             out["truncated"] = True
-            out["hint"] = (
-                f"Showing {len(sample)}/{total} rows. "
-                "Use response_mode='full' for all rows."
-            )
     else:  # full
         if total > TRUNCATION_THRESHOLD:
             head_n = TRUNCATION_THRESHOLD - TRUNCATION_TAIL
@@ -263,7 +249,7 @@ def _format_sql(
             out["rows"] = records
             out["truncated"] = False
 
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps(out, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +643,88 @@ def _extract_position_chart_refs(position_json: Any) -> dict[str, int]:
     return refs
 
 
+def _find_duplicate_chart_placements(
+    position_json: Any,
+) -> list[dict[str, Any]]:
+    """Find chart IDs placed in multiple layout nodes."""
+    refs = _extract_position_chart_refs(position_json)
+    chart_to_nodes: dict[int, list[str]] = {}
+    for node_id, chart_id in refs.items():
+        chart_to_nodes.setdefault(chart_id, []).append(node_id)
+    return [
+        {"chart_id": chart_id, "layout_nodes": sorted(nodes)}
+        for chart_id, nodes in sorted(chart_to_nodes.items())
+        if len(nodes) > 1
+    ]
+
+
+def _deduplicate_layout_containers(position_json: dict[str, Any]) -> dict[str, Any]:
+    """Remove duplicate chart container nodes from a dashboard layout.
+
+    After a ZIP import, Superset may duplicate ROW/CHART containers.
+    This keeps the first occurrence of each chart_id (by sorted node key)
+    and prunes the duplicate nodes plus their parent references.
+    """
+    if not position_json:
+        return position_json
+
+    refs = _extract_position_chart_refs(position_json)
+    chart_to_nodes: dict[int, list[str]] = {}
+    for node_id, chart_id in refs.items():
+        chart_to_nodes.setdefault(chart_id, []).append(node_id)
+
+    nodes_to_remove: set[str] = set()
+    for chart_id, node_ids in chart_to_nodes.items():
+        if len(node_ids) <= 1:
+            continue
+        # Keep the first (sorted) node, remove the rest
+        for dup_node in sorted(node_ids)[1:]:
+            nodes_to_remove.add(dup_node)
+
+    if not nodes_to_remove:
+        return position_json
+
+    cleaned = dict(position_json)
+    for node_id in nodes_to_remove:
+        cleaned.pop(node_id, None)
+
+    # Remove references to deleted nodes from parent children lists
+    for node_id, node in cleaned.items():
+        if not isinstance(node, dict):
+            continue
+        children = node.get("children")
+        if isinstance(children, list):
+            filtered = [c for c in children if str(c) not in nodes_to_remove]
+            if len(filtered) != len(children):
+                node["children"] = filtered
+
+    # Prune empty wrapper rows that no longer have children
+    empty_wrappers: set[str] = set()
+    for node_id, node in list(cleaned.items()):
+        if not isinstance(node, dict):
+            continue
+        ntype = node.get("type", "")
+        if ntype in ("ROW", "COLUMN") and node.get("children") == []:
+            # Only remove if the wrapper is not ROOT_ID or GRID_ID
+            if node_id not in ("ROOT_ID", "GRID_ID"):
+                empty_wrappers.add(node_id)
+
+    for node_id in empty_wrappers:
+        cleaned.pop(node_id, None)
+
+    # Clean up parent references to removed wrappers
+    for node_id, node in cleaned.items():
+        if not isinstance(node, dict):
+            continue
+        children = node.get("children")
+        if isinstance(children, list):
+            filtered = [c for c in children if str(c) not in empty_wrappers]
+            if len(filtered) != len(children):
+                node["children"] = filtered
+
+    return cleaned
+
+
 def _extract_scope_chart_refs(json_metadata: Any) -> set[int]:
     payload = _ensure_json_dict(json_metadata, "json_metadata")
     charts_in_scope = payload.get("chartsInScope")
@@ -920,6 +988,7 @@ def _dashboard_structure_report(
     }
     layout_chart_ids = set(_extract_position_chart_refs(position).values())
     scope_chart_ids = _extract_scope_chart_refs(metadata)
+    duplicate_chart_placements = _find_duplicate_chart_placements(position)
 
     layout_orphans = sorted(layout_chart_ids - attached_chart_ids)
     scope_orphans = sorted(scope_chart_ids - attached_chart_ids)
@@ -942,6 +1011,7 @@ def _dashboard_structure_report(
         or layout_orphans
         or scope_orphans
         or attached_missing_layout
+        or duplicate_chart_placements
     ):
         status = "warning"
 
@@ -963,6 +1033,7 @@ def _dashboard_structure_report(
         "layout_orphans": layout_orphans,
         "scope_orphans": scope_orphans,
         "attached_missing_layout": attached_missing_layout,
+        "duplicate_chart_placements": duplicate_chart_placements,
     }
 
 
@@ -1430,7 +1501,7 @@ def _do_mutation(
             after_summary=dry_after,
             dry_run=True,
         ))
-        return json.dumps(preview, indent=2, default=str)
+        return json.dumps(preview, default=str)
 
     # -- Execute path -------------------------------------------------------
     result = execute()
@@ -1469,7 +1540,7 @@ def _do_mutation(
         after_summary=after_summary,
     ))
 
-    return json.dumps(response, indent=2, default=str)
+    return json.dumps(response, default=str)
 
 
 # ===================================================================
@@ -1486,7 +1557,7 @@ def list_workspaces() -> str:
     use_workspace.
     """
     ws = _get_ws()
-    return json.dumps(ws.list_workspaces(), indent=2)
+    return json.dumps(ws.list_workspaces())
 
 
 @mcp.tool()
@@ -1806,7 +1877,7 @@ def workspace_catalog() -> str:
     _log.info(
         "workspace_catalog counts=%s", catalog["counts"],
     )
-    return json.dumps(catalog, indent=2, default=str)
+    return json.dumps(catalog, default=str)
 
 
 # ===================================================================
@@ -2097,7 +2168,7 @@ def describe_dashboard(
             "dataset_count": len(dataset_inventory),
             "markdown_block_count": len(markdown_blocks),
             "warning_count": len(warnings),
-        }, indent=2, default=str)
+        }, default=str)
 
     result: dict[str, Any] = {
         "dashboard": dashboard_meta,
@@ -2112,7 +2183,7 @@ def describe_dashboard(
         result["warning_count"] = len(warnings)
         result["warnings_preview"] = warnings[:3]
 
-    return json.dumps(result, indent=2, default=str)
+    return json.dumps(result, default=str)
 
 
 # ===================================================================
@@ -2163,7 +2234,7 @@ def validate_chart(
             "dashboard_id": result.get("dashboard_id"),
             "status": status,
             "error": result.get("error"),
-        }, indent=2, default=str)
+        }, default=str)
     if response_mode == "standard":
         return json.dumps({
             "chart_id": result.get("chart_id"),
@@ -2180,8 +2251,8 @@ def validate_chart(
             "payload_source": result.get("payload_source"),
             "form_data_source": result.get("form_data_source"),
             "query_context_present": result.get("query_context_present"),
-        }, indent=2, default=str)
-    return json.dumps(result, indent=2, default=str)
+        }, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2212,7 +2283,7 @@ def validate_dashboard(
             "validated": result["validated"],
             "broken_count": len(errors),
             "broken_charts": errors,
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
         summary = {
@@ -2231,8 +2302,8 @@ def validate_dashboard(
                 for item in result.get("results", [])
             ],
         }
-        return json.dumps(summary, indent=2, default=str)
-    return json.dumps(result, indent=2, default=str)
+        return json.dumps(summary, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2257,7 +2328,7 @@ def validate_chart_render(
             "status": result.get("status"),
             "error": result.get("error"),
             "screenshot_path": result.get("screenshot_path"),
-        }, indent=2, default=str)
+        }, default=str)
     if response_mode == "standard":
         return json.dumps({
             "chart_id": result.get("chart_id"),
@@ -2269,8 +2340,8 @@ def validate_chart_render(
             "page_errors": result.get("page_errors"),
             "chart_data_failures": result.get("chart_data_failures"),
             "screenshot_path": result.get("screenshot_path"),
-        }, indent=2, default=str)
-    return json.dumps(result, indent=2, default=str)
+        }, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2294,7 +2365,7 @@ def validate_dashboard_render(
             "chart_count": result.get("chart_count"),
             "validated": result.get("validated"),
             "broken_count": result.get("broken_count"),
-        }, indent=2, default=str)
+        }, default=str)
     if response_mode == "standard":
         broken_summaries: list[dict[str, Any]] = []
         for item in result.get("broken_charts", []):
@@ -2317,8 +2388,8 @@ def validate_dashboard_render(
             "validated": result.get("validated"),
             "broken_count": result.get("broken_count"),
             "broken_charts": broken_summaries,
-        }, indent=2, default=str)
-    return json.dumps(result, indent=2, default=str)
+        }, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2411,7 +2482,7 @@ def verify_chart_workflow(
                 int((dashboard_render or {}).get("broken_count") or 0)
                 if isinstance(dashboard_render, dict) else None
             ),
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
         return json.dumps({
@@ -2452,9 +2523,9 @@ def verify_chart_workflow(
                 }
                 if isinstance(dashboard_render, dict) else None
             ),
-        }, indent=2, default=str)
+        }, default=str)
 
-    return json.dumps(result, indent=2, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2484,7 +2555,8 @@ def verify_dashboard_structure(
             "dangling_child_count": len(report.get("dangling_children", [])),
             "missing_id_count": len(report.get("missing_id_nodes", [])),
             "missing_type_count": len(report.get("missing_type_nodes", [])),
-        }, indent=2, default=str)
+            "duplicate_chart_count": len(report.get("duplicate_chart_placements", [])),
+        }, default=str)
 
     if response_mode == "standard":
         return json.dumps({
@@ -2500,13 +2572,14 @@ def verify_dashboard_structure(
             "layout_orphans": report.get("layout_orphans"),
             "scope_orphans": report.get("scope_orphans"),
             "attached_missing_layout": report.get("attached_missing_layout"),
-        }, indent=2, default=str)
+            "duplicate_chart_placements": report.get("duplicate_chart_placements"),
+        }, default=str)
 
     return json.dumps({
         "dashboard_id": dashboard_id,
         "dashboard_title": dashboard.get("dashboard_title"),
         "structure_report": report,
-    }, indent=2, default=str)
+    }, default=str)
 
 
 @mcp.tool()
@@ -2567,7 +2640,7 @@ def verify_dashboard_workflow(
             "structure_status": structure.get("status"),
             "query_failures": query_failures,
             "render_broken_count": render_broken if include_render else None,
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
         return json.dumps({
@@ -2593,7 +2666,7 @@ def verify_dashboard_workflow(
                 if include_render and isinstance(render_result, dict)
                 else None
             ),
-        }, indent=2, default=str)
+        }, default=str)
 
     return json.dumps({
         "dashboard_id": dashboard_id,
@@ -2602,7 +2675,7 @@ def verify_dashboard_workflow(
         "structure_report": structure,
         "query_validation": query_result,
         "render_validation": render_result,
-    }, indent=2, default=str)
+    }, default=str)
 
 
 @mcp.tool()
@@ -2642,7 +2715,7 @@ def capture_dashboard_template(
             "chart_count": chart_count,
             "structure_status": structure.get("status"),
             "output_path": resolved_output,
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
         return json.dumps({
@@ -2657,13 +2730,12 @@ def capture_dashboard_template(
             },
             "example_charts": template.get("charts", [])[:3],
             "output_path": resolved_output,
-            "hint": "Use response_mode='full' to get the full template JSON inline.",
-        }, indent=2, default=str)
+        }, default=str)
 
     payload = dict(template)
     if resolved_output:
         payload["_saved_to"] = resolved_output
-    return json.dumps(payload, indent=2, default=str)
+    return json.dumps(payload, default=str)
 
 
 @mcp.tool()
@@ -2741,12 +2813,12 @@ def capture_golden_templates(
             "output_dir": str(target_dir),
             "saved_count": len(saved),
             "failed_count": len(failures),
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
-        return json.dumps(payload, indent=2, default=str)
+        return json.dumps(payload, default=str)
 
-    return json.dumps(payload, indent=2, default=str)
+    return json.dumps(payload, default=str)
 
 
 # ===================================================================
@@ -2980,7 +3052,7 @@ def create_chart(
         payload["_params_warnings"] = params_warnings
     chart_id = _to_int(payload.get("id"))
     if chart_id is None:
-        return json.dumps(payload, indent=2, default=str)
+        return json.dumps(payload, default=str)
 
     if repair_dashboard_refs and dashboards_list:
         repairs: list[dict[str, Any]] = []
@@ -3012,7 +3084,7 @@ def create_chart(
             operation_name="creation",
             operation_past_tense="created",
         )
-    return json.dumps(payload, indent=2, default=str)
+    return json.dumps(payload, default=str)
 
 
 # ===================================================================
@@ -3257,7 +3329,7 @@ def update_chart(
             operation_name="update",
             operation_past_tense="updated",
         )
-    return json.dumps(payload, indent=2, default=str)
+    return json.dumps(payload, default=str)
 
 
 @mcp.tool()
@@ -3397,7 +3469,7 @@ def repair_dashboard_chart_refs(
         }
         if dry_run:
             payload["dry_run"] = True
-        return json.dumps(payload, indent=2, default=str)
+        return json.dumps(payload, default=str)
 
     return _do_mutation(
         tool_name="repair_dashboard_chart_refs",
@@ -3422,6 +3494,66 @@ def repair_dashboard_chart_refs(
     )
 
 
+@mcp.tool()
+@_handle_errors
+def repair_dashboard_layout_duplicates(
+    dashboard_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Remove duplicate chart container nodes from a dashboard layout.
+
+    After a ZIP import, Superset may duplicate ROW/CHART containers causing
+    charts to render twice.  This tool detects and removes the duplicates.
+
+    Args:
+        dashboard_id: Dashboard ID to repair
+        dry_run: If True, preview without mutating (default: False)
+    """
+    ws = _get_ws()
+    before = capture_before(ws, "dashboard", dashboard_id)
+    if "_snapshot_error" in before:
+        raise ValueError(
+            f"Dashboard {dashboard_id} not found. Use list_dashboards to find valid IDs."
+        )
+
+    position = _ensure_json_dict(before.get("position_json", {}), "position_json")
+    dupes = _find_duplicate_chart_placements(position)
+
+    if not dupes:
+        return json.dumps({
+            "status": "noop",
+            "dashboard_id": dashboard_id,
+            "duplicate_chart_placements": [],
+            "message": "No duplicate chart placements found.",
+        }, default=str)
+
+    cleaned = _deduplicate_layout_containers(position)
+
+    return _do_mutation(
+        tool_name="repair_dashboard_layout_duplicates",
+        resource_type="dashboard",
+        action="update",
+        fields_changed=["position_json"],
+        dry_run=dry_run,
+        execute=lambda: ws.update_dashboard(
+            dashboard_id,
+            position_json=json.dumps(cleaned),
+        ),
+        resource_id=dashboard_id,
+        before=before,
+        preview_extras={
+            "duplicate_chart_placements": dupes,
+            "nodes_before": len(position),
+            "nodes_after": len(cleaned),
+        },
+        result_extras={
+            "duplicate_chart_placements_fixed": dupes,
+            "nodes_before": len(position),
+            "nodes_after": len(cleaned),
+        },
+    )
+
+
 # ===================================================================
 # Tools — Snapshot
 # ===================================================================
@@ -3439,7 +3571,7 @@ def snapshot_workspace() -> str:
     ws = _get_ws()
     snap = ws.snapshot()
     _log.info("snapshot counts=%s", snap.counts)
-    return json.dumps(snap.model_dump(), indent=2, default=str)
+    return json.dumps(snap.model_dump(), default=str)
 
 
 # ===================================================================
@@ -3506,7 +3638,7 @@ def list_mutations(
         "resource_id": resource_id,
         "tool_name": tool_name,
         "entries": entries,
-    }, indent=2, default=str)
+    }, default=str)
 
 
 @mcp.tool()
@@ -3525,7 +3657,7 @@ def list_dashboard_snapshots(
             "count": 0,
             "dashboard_id": dashboard_id,
             "snapshots": [],
-        }, indent=2, default=str)
+        }, default=str)
 
     pattern = "dashboard_*.json" if dashboard_id is None else f"dashboard_{dashboard_id}_*.json"
     files = sorted(
@@ -3552,7 +3684,7 @@ def list_dashboard_snapshots(
         "count": len(records),
         "dashboard_id": dashboard_id,
         "snapshots": records,
-    }, indent=2, default=str)
+    }, default=str)
 
 
 @mcp.tool()
@@ -3561,9 +3693,20 @@ def restore_dashboard_snapshot(
     dashboard_id: int,
     snapshot_path: str,
     restore_json_metadata: bool = True,
+    allow_id_mismatch: bool = False,
     dry_run: bool = False,
 ) -> str:
-    """Restore dashboard layout/settings from a local snapshot JSON file."""
+    """Restore dashboard layout/settings from a local snapshot JSON file.
+
+    Args:
+        dashboard_id: Target dashboard to restore into.
+        snapshot_path: Path to snapshot JSON file.
+        restore_json_metadata: Whether to restore json_metadata too (default: True).
+        allow_id_mismatch: If True, allow restoring a snapshot taken from a
+            different dashboard ID into *dashboard_id*.  Useful when a dashboard
+            was deleted and re-imported with a new ID (default: False).
+        dry_run: If True, preview without mutating (default: False).
+    """
     ws = _get_ws()
     _require_dashboards_exist(ws, [dashboard_id])
 
@@ -3581,10 +3724,12 @@ def restore_dashboard_snapshot(
 
     snap_dashboard_id = _to_int(snapshot.get("id"))
     if snap_dashboard_id is not None and snap_dashboard_id != dashboard_id:
-        raise ValueError(
-            f"Snapshot dashboard id {snap_dashboard_id} does not match requested "
-            f"dashboard_id {dashboard_id}."
-        )
+        if not allow_id_mismatch:
+            raise ValueError(
+                f"Snapshot dashboard id {snap_dashboard_id} does not match requested "
+                f"dashboard_id {dashboard_id}. Pass allow_id_mismatch=True to "
+                f"restore this snapshot into a different dashboard."
+            )
 
     restored_position = _ensure_json_dict(snapshot.get("position_json"), "position_json")
     _validate_position_layout(restored_position)
@@ -3617,6 +3762,136 @@ def restore_dashboard_snapshot(
             "restore_json_metadata": restore_json_metadata,
         },
     )
+
+
+# ===================================================================
+# Tools — Dashboard Export / Import (always available)
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def export_dashboard(
+    dashboard_id: int,
+    output_path: str | None = None,
+) -> str:
+    """Export a dashboard as a ZIP bundle for backup or migration.
+
+    The ZIP contains the dashboard definition, its charts, and datasets.
+    If *output_path* is provided the ZIP is written to disk; otherwise it
+    is saved to the default audit exports directory.
+
+    Args:
+        dashboard_id: Dashboard to export
+        output_path: Optional file path to save the ZIP (default: auto)
+    """
+    ws = _get_ws()
+    _require_dashboards_exist(ws, [dashboard_id])
+
+    zip_bytes = ws.export_resource_zip("dashboard", [dashboard_id])
+
+    if output_path:
+        dest = Path(output_path).expanduser()
+    else:
+        exports_dir = AUDIT_DIR / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = exports_dir / f"dashboard_{dashboard_id}_{ts}.zip"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(zip_bytes)
+
+    record_mutation(MutationEntry(
+        tool_name="export_dashboard",
+        resource_type="dashboard",
+        resource_id=dashboard_id,
+        action="create",
+        after_summary={
+            "export_path": str(dest),
+            "size_bytes": len(zip_bytes),
+        },
+    ))
+
+    return json.dumps({
+        "status": "exported",
+        "dashboard_id": dashboard_id,
+        "export_path": str(dest),
+        "size_bytes": len(zip_bytes),
+    }, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def import_dashboard(
+    import_path: str,
+    overwrite: bool = False,
+    deduplicate_layout: bool = True,
+) -> str:
+    """Import a dashboard from a ZIP bundle.
+
+    Args:
+        import_path: Path to the ZIP file to import
+        overwrite: If True, overwrite existing dashboards with same IDs
+                   (default: False)
+        deduplicate_layout: If True, automatically fix duplicate chart
+                            containers that Superset may create during
+                            import (default: True)
+    """
+    ws = _get_ws()
+    path = Path(import_path).expanduser()
+    if not path.exists():
+        raise ValueError(f"Import file not found: {import_path}")
+
+    data = path.read_bytes()
+    result = ws.import_resource_zip("dashboard", data, overwrite=overwrite)
+
+    dedup_summary: dict[str, Any] | None = None
+    if deduplicate_layout and result:
+        dashboards = ws.dashboards()
+        for dash in dashboards:
+            dash_id = _to_int(dash.get("id"))
+            if dash_id is None:
+                continue
+            try:
+                detail = ws.dashboard_detail(dash_id)
+                pos = _ensure_json_dict(
+                    detail.get("position_json", {}), "position_json",
+                )
+                dupes = _find_duplicate_chart_placements(pos)
+                if dupes:
+                    cleaned = _deduplicate_layout_containers(pos)
+                    ws.update_dashboard(
+                        dash_id,
+                        position_json=json.dumps(cleaned),
+                    )
+                    dedup_summary = {
+                        "dashboard_id": dash_id,
+                        "duplicates_removed": len(dupes),
+                    }
+            except Exception:
+                pass  # best-effort dedup
+
+    record_mutation(MutationEntry(
+        tool_name="import_dashboard",
+        resource_type="dashboard",
+        action="create",
+        after_summary={
+            "import_path": str(path),
+            "overwrite": overwrite,
+            "success": result,
+            "dedup_applied": dedup_summary,
+        },
+    ))
+
+    response: dict[str, Any] = {
+        "status": "imported",
+        "import_path": str(path),
+        "overwrite": overwrite,
+        "success": result,
+    }
+    if dedup_summary:
+        response["layout_dedup"] = dedup_summary
+    return json.dumps(response, default=str)
 
 
 # ===================================================================
@@ -3757,7 +4032,7 @@ if _DELETE_ENABLED:
         """
         exports_dir = AUDIT_DIR / "exports"
         if not exports_dir.exists():
-            return json.dumps({"backups": [], "count": 0}, indent=2)
+            return json.dumps({"backups": [], "count": 0})
 
         backups: list[dict[str, Any]] = []
         for f in sorted(exports_dir.glob("*.zip")):
@@ -3782,7 +4057,7 @@ if _DELETE_ENABLED:
         return json.dumps({
             "backups": backups,
             "count": len(backups),
-        }, indent=2)
+        })
 
     @mcp.tool()
     @_handle_errors
@@ -3817,6 +4092,33 @@ if _DELETE_ENABLED:
             resource_type, export_path, overwrite,
         )
 
+        # Post-import deduplication for dashboards (fixes issue #39)
+        dedup_summary: dict[str, Any] | None = None
+        if resource_type == "dashboard" and result:
+            dashboards = ws.dashboards()
+            for dash in dashboards:
+                dash_id = _to_int(dash.get("id"))
+                if dash_id is None:
+                    continue
+                try:
+                    detail = ws.dashboard_detail(dash_id)
+                    pos = _ensure_json_dict(
+                        detail.get("position_json", {}), "position_json",
+                    )
+                    dupes = _find_duplicate_chart_placements(pos)
+                    if dupes:
+                        cleaned = _deduplicate_layout_containers(pos)
+                        ws.update_dashboard(
+                            dash_id,
+                            position_json=json.dumps(cleaned),
+                        )
+                        dedup_summary = {
+                            "dashboard_id": dash_id,
+                            "duplicates_removed": len(dupes),
+                        }
+                except Exception:
+                    pass  # best-effort dedup
+
         record_mutation(MutationEntry(
             tool_name="restore_from_backup",
             resource_type=resource_type,
@@ -3825,16 +4127,751 @@ if _DELETE_ENABLED:
                 "export_path": export_path,
                 "overwrite": overwrite,
                 "success": result,
+                "dedup_applied": dedup_summary,
             },
         ))
 
-        return json.dumps({
+        response: dict[str, Any] = {
             "status": "restored",
             "resource_type": resource_type,
             "export_path": export_path,
             "overwrite": overwrite,
             "success": result,
-        }, indent=2)
+        }
+        if dedup_summary:
+            response["layout_dedup"] = dedup_summary
+        return json.dumps(response)
+
+
+# ===================================================================
+# Tools — Saved Queries
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def list_saved_queries(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+) -> str:
+    """List saved SQL queries in the current workspace.
+
+    Saved queries are reusable SQL snippets stored in SQL Lab.
+    Use this to discover query IDs, then pass one to get_saved_query
+    for full detail.
+
+    Args:
+        response_mode: 'compact' (id+label), 'standard' (key fields),
+                       or 'full' (raw API response).  Default: standard.
+        name_contains: Case-insensitive substring filter on the query label.
+    """
+    ws = _get_ws()
+    records = ws.saved_queries()
+    if name_contains:
+        needle = name_contains.lower()
+        records = [
+            r for r in records
+            if needle in str(r.get("label", "")).lower()
+        ]
+    if response_mode == "compact":
+        data = _pick(records, ["id", "label", "db_id"])
+    elif response_mode == "standard":
+        data = _pick(records, [
+            "id", "label", "db_id", "schema", "sql",
+            "changed_on", "description",
+        ])
+    else:
+        data = records
+    out: dict[str, Any] = {
+        "count": len(records),
+        "data": data,
+    }
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def get_saved_query(
+    query_id: int,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Get detail for a single saved query.
+
+    Args:
+        query_id: The saved query ID.
+        response_mode: 'compact', 'standard', or 'full'.
+    """
+    ws = _get_ws()
+    record = ws.saved_query_detail(query_id)
+    if response_mode == "compact":
+        data = {k: record[k] for k in ["id", "label", "db_id", "schema"] if k in record}
+    elif response_mode == "standard":
+        data = {k: record[k] for k in [
+            "id", "label", "db_id", "schema", "sql",
+            "description", "changed_on",
+        ] if k in record}
+    else:
+        data = record
+    return json.dumps({"data": data}, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def create_saved_query(
+    label: str,
+    sql: str,
+    database_id: int,
+    schema: str | None = None,
+    description: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Create a new saved SQL query in SQL Lab.
+
+    Saved queries persist reusable SQL snippets associated with a database.
+
+    Args:
+        label: Name / label for the saved query.
+        sql: The SQL text to save.
+        database_id: ID of the database this query targets.
+        schema: Optional schema context (e.g. 'public').
+        description: Optional description of the query.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    fields = ["label", "sql", "db_id"]
+    if schema:
+        fields.append("schema")
+    if description:
+        fields.append("description")
+
+    return _do_mutation(
+        tool_name="create_saved_query",
+        resource_type="saved_query",
+        action="create",
+        fields_changed=fields,
+        dry_run=dry_run,
+        execute=lambda: ws.create_saved_query(
+            label=label, sql=sql, database_id=database_id,
+            schema=schema, description=description,
+        ),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def update_saved_query(
+    query_id: int,
+    label: str | None = None,
+    sql: str | None = None,
+    description: str | None = None,
+    schema: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Update an existing saved query.
+
+    Args:
+        query_id: The saved query ID to update.
+        label: New label (name) for the query.
+        sql: New SQL text.
+        description: New description.
+        schema: New schema context.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    kwargs: dict[str, Any] = {}
+    if label is not None:
+        kwargs["label"] = label
+    if sql is not None:
+        kwargs["sql"] = sql
+    if description is not None:
+        kwargs["description"] = description
+    if schema is not None:
+        kwargs["schema"] = schema
+
+    if not kwargs:
+        raise ValueError("No fields to update. Pass at least one of: label, sql, description, schema.")
+
+    before = capture_before(ws, "saved_query", query_id)
+
+    return _do_mutation(
+        tool_name="update_saved_query",
+        resource_type="saved_query",
+        action="update",
+        resource_id=query_id,
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.update_saved_query(query_id, **kwargs),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def delete_saved_query(
+    query_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Delete a saved query.
+
+    Args:
+        query_id: The saved query ID to delete.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    before = capture_before(ws, "saved_query", query_id)
+
+    return _do_mutation(
+        tool_name="delete_saved_query",
+        resource_type="saved_query",
+        action="delete",
+        resource_id=query_id,
+        fields_changed=[],
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.delete_saved_query(query_id) or {},
+    )
+
+
+# ===================================================================
+# Tools — CSS Templates
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def list_css_templates(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+) -> str:
+    """List CSS templates in the current workspace.
+
+    CSS templates define reusable dashboard styling.  Use this to discover
+    template IDs, then pass one to get_css_template for full detail.
+
+    Args:
+        response_mode: 'compact' (id+name), 'standard' (key fields),
+                       or 'full' (raw API response).  Default: standard.
+        name_contains: Case-insensitive substring filter on template_name.
+    """
+    ws = _get_ws()
+    records = ws.css_templates()
+    if name_contains:
+        needle = name_contains.lower()
+        records = [
+            r for r in records
+            if needle in str(r.get("template_name", "")).lower()
+        ]
+    if response_mode == "compact":
+        data = _pick(records, ["id", "template_name"])
+    elif response_mode == "standard":
+        data = _pick(records, [
+            "id", "template_name", "css", "changed_on",
+        ])
+    else:
+        data = records
+    out: dict[str, Any] = {
+        "count": len(records),
+        "data": data,
+    }
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def get_css_template(
+    template_id: int,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Get detail for a single CSS template.
+
+    Args:
+        template_id: The CSS template ID.
+        response_mode: 'compact', 'standard', or 'full'.
+    """
+    ws = _get_ws()
+    record = ws.css_template_detail(template_id)
+    if response_mode == "compact":
+        data = {k: record[k] for k in ["id", "template_name"] if k in record}
+    elif response_mode == "standard":
+        data = {k: record[k] for k in [
+            "id", "template_name", "css", "changed_on",
+        ] if k in record}
+    else:
+        data = record
+    return json.dumps({"data": data}, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def create_css_template(
+    template_name: str,
+    css: str,
+    dry_run: bool = False,
+) -> str:
+    """Create a new CSS template for dashboard styling.
+
+    Args:
+        template_name: Name for the CSS template.
+        css: The CSS stylesheet text.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+
+    return _do_mutation(
+        tool_name="create_css_template",
+        resource_type="css_template",
+        action="create",
+        fields_changed=["template_name", "css"],
+        dry_run=dry_run,
+        execute=lambda: ws.create_css_template(
+            template_name=template_name, css=css,
+        ),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def update_css_template(
+    template_id: int,
+    template_name: str | None = None,
+    css: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Update an existing CSS template.
+
+    Args:
+        template_id: The CSS template ID to update.
+        template_name: New name for the template.
+        css: New CSS stylesheet text.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    kwargs: dict[str, Any] = {}
+    if template_name is not None:
+        kwargs["template_name"] = template_name
+    if css is not None:
+        kwargs["css"] = css
+
+    if not kwargs:
+        raise ValueError("No fields to update. Pass at least one of: template_name, css.")
+
+    before = capture_before(ws, "css_template", template_id)
+
+    return _do_mutation(
+        tool_name="update_css_template",
+        resource_type="css_template",
+        action="update",
+        resource_id=template_id,
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.update_css_template(template_id, **kwargs),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def delete_css_template(
+    template_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Delete a CSS template.
+
+    Args:
+        template_id: The CSS template ID to delete.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    before = capture_before(ws, "css_template", template_id)
+
+    return _do_mutation(
+        tool_name="delete_css_template",
+        resource_type="css_template",
+        action="delete",
+        resource_id=template_id,
+        fields_changed=[],
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.delete_css_template(template_id) or {},
+    )
+
+
+# ===================================================================
+# Tools — Annotation Layers
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def list_annotation_layers(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+) -> str:
+    """List annotation layers in the current workspace.
+
+    Annotation layers let you overlay time-based markers on charts
+    (e.g. deploys, incidents).  Use this to discover layer IDs.
+
+    Args:
+        response_mode: 'compact' (id+name), 'standard' (key fields),
+                       or 'full' (raw API response).  Default: standard.
+        name_contains: Case-insensitive substring filter on layer name.
+    """
+    ws = _get_ws()
+    records = ws.annotation_layers()
+    if name_contains:
+        needle = name_contains.lower()
+        records = [
+            r for r in records
+            if needle in str(r.get("name", "")).lower()
+        ]
+    if response_mode == "compact":
+        data = _pick(records, ["id", "name"])
+    elif response_mode == "standard":
+        data = _pick(records, [
+            "id", "name", "descr", "changed_on",
+        ])
+    else:
+        data = records
+    out: dict[str, Any] = {
+        "count": len(records),
+        "data": data,
+    }
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def get_annotation_layer(
+    layer_id: int,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Get detail for a single annotation layer including its annotations.
+
+    Args:
+        layer_id: The annotation layer ID.
+        response_mode: 'compact', 'standard', or 'full'.
+    """
+    ws = _get_ws()
+    record = ws.annotation_layer_detail(layer_id)
+    annotations = ws.annotation_layer_annotations(layer_id)
+
+    if response_mode == "compact":
+        data = {k: record[k] for k in ["id", "name"] if k in record}
+        data["annotation_count"] = len(annotations)
+    elif response_mode == "standard":
+        data = {k: record[k] for k in [
+            "id", "name", "descr", "changed_on",
+        ] if k in record}
+        data["annotations"] = [
+            {k: a[k] for k in ["id", "short_descr", "start_dttm", "end_dttm"] if k in a}
+            for a in annotations
+        ]
+    else:
+        data = {**record, "annotations": annotations}
+    return json.dumps({"data": data}, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def create_annotation_layer(
+    name: str,
+    descr: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Create a new annotation layer.
+
+    Annotation layers group time-based annotations that can be overlaid
+    on time-series charts.  After creating a layer, use create_annotation
+    to add individual annotations.
+
+    Args:
+        name: Name for the annotation layer.
+        descr: Optional description.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    fields = ["name"]
+    if descr:
+        fields.append("descr")
+
+    return _do_mutation(
+        tool_name="create_annotation_layer",
+        resource_type="annotation_layer",
+        action="create",
+        fields_changed=fields,
+        dry_run=dry_run,
+        execute=lambda: ws.create_annotation_layer(name=name, descr=descr),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def update_annotation_layer(
+    layer_id: int,
+    name: str | None = None,
+    descr: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Update an existing annotation layer.
+
+    Args:
+        layer_id: The annotation layer ID to update.
+        name: New name for the layer.
+        descr: New description.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    kwargs: dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if descr is not None:
+        kwargs["descr"] = descr
+
+    if not kwargs:
+        raise ValueError("No fields to update. Pass at least one of: name, descr.")
+
+    before = capture_before(ws, "annotation_layer", layer_id)
+
+    return _do_mutation(
+        tool_name="update_annotation_layer",
+        resource_type="annotation_layer",
+        action="update",
+        resource_id=layer_id,
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.update_annotation_layer(layer_id, **kwargs),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def delete_annotation_layer(
+    layer_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Delete an annotation layer and all its annotations.
+
+    Args:
+        layer_id: The annotation layer ID to delete.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    before = capture_before(ws, "annotation_layer", layer_id)
+
+    return _do_mutation(
+        tool_name="delete_annotation_layer",
+        resource_type="annotation_layer",
+        action="delete",
+        resource_id=layer_id,
+        fields_changed=[],
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.delete_annotation_layer(layer_id) or {},
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def create_annotation(
+    layer_id: int,
+    short_descr: str,
+    start_dttm: str,
+    end_dttm: str,
+    long_descr: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Add an annotation to an existing annotation layer.
+
+    Annotations are time-based markers that overlay on time-series charts.
+    Use list_annotation_layers or get_annotation_layer to find layer IDs.
+
+    Args:
+        layer_id: The annotation layer ID to add this annotation to.
+        short_descr: Short description (label) shown on the chart overlay.
+        start_dttm: Start datetime in ISO 8601 format (e.g. '2024-01-15T00:00:00').
+        end_dttm: End datetime in ISO 8601 format (e.g. '2024-01-16T00:00:00').
+        long_descr: Optional longer description with details.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    fields = ["short_descr", "start_dttm", "end_dttm"]
+    if long_descr:
+        fields.append("long_descr")
+
+    return _do_mutation(
+        tool_name="create_annotation",
+        resource_type="annotation",
+        action="create",
+        fields_changed=fields,
+        dry_run=dry_run,
+        execute=lambda: ws.create_annotation(
+            layer_id=layer_id,
+            short_descr=short_descr,
+            start_dttm=start_dttm,
+            end_dttm=end_dttm,
+            long_descr=long_descr,
+        ),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def delete_annotation(
+    layer_id: int,
+    annotation_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Delete a specific annotation from an annotation layer.
+
+    Args:
+        layer_id: The annotation layer ID.
+        annotation_id: The annotation ID to delete.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+
+    return _do_mutation(
+        tool_name="delete_annotation",
+        resource_type="annotation",
+        action="delete",
+        resource_id=annotation_id,
+        fields_changed=[],
+        dry_run=dry_run,
+        execute=lambda: ws.delete_annotation(layer_id, annotation_id) or {},
+    )
+
+
+# ===================================================================
+# Tools — Async Query Results
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def get_async_query_result(
+    query_id: str,
+) -> str:
+    """Fetch results of an async SQL query by its query ID (key).
+
+    When SQL Lab runs a query asynchronously, it returns a query ID
+    (also called a 'key').  Use this tool to poll for and retrieve
+    the results once the query completes.
+
+    Args:
+        query_id: The query ID / key returned by an async SQL Lab query.
+    """
+    ws = _get_ws()
+    result = ws.async_query_result(query_id)
+    return json.dumps(result, default=str)
+
+
+# ===================================================================
+# Tools — Embedded Dashboards
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def get_embedded_dashboard(
+    dashboard_id: int,
+) -> str:
+    """Get the embedded configuration for a dashboard.
+
+    Returns the embedding UUID and allowed domains if embedding is enabled,
+    or indicates that embedding is not configured.
+
+    Args:
+        dashboard_id: The dashboard ID.
+    """
+    ws = _get_ws()
+    result = ws.get_embedded_dashboard(dashboard_id)
+    if result is None:
+        return json.dumps({
+            "dashboard_id": dashboard_id,
+            "embedded": False,
+        })
+    return json.dumps({
+        "dashboard_id": dashboard_id,
+        "embedded": True,
+        "data": result,
+    }, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def enable_embedded_dashboard(
+    dashboard_id: int,
+    allowed_domains: list[str] | str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Enable embedding for a dashboard and return its embed UUID.
+
+    The returned UUID is used to embed the dashboard in external
+    applications via the Superset embedded SDK.
+
+    Args:
+        dashboard_id: The dashboard ID to enable embedding for.
+        allowed_domains: List of domains allowed to embed (e.g.
+                         '["app.example.com"]').  Pass an empty list to
+                         allow all origins.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    domains: list[str] = []
+    if isinstance(allowed_domains, str):
+        try:
+            parsed = json.loads(allowed_domains)
+            if isinstance(parsed, list):
+                domains = [str(d) for d in parsed]
+            else:
+                domains = [str(allowed_domains)]
+        except (json.JSONDecodeError, TypeError):
+            domains = [d.strip() for d in allowed_domains.split(",") if d.strip()]
+    elif isinstance(allowed_domains, list):
+        domains = [str(d) for d in allowed_domains]
+
+    return _do_mutation(
+        tool_name="enable_embedded_dashboard",
+        resource_type="dashboard",
+        action="update",
+        resource_id=dashboard_id,
+        fields_changed=["embedded", "allowed_domains"],
+        dry_run=dry_run,
+        execute=lambda: ws.create_embedded_dashboard(
+            dashboard_id=dashboard_id,
+            allowed_domains=domains,
+        ),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def disable_embedded_dashboard(
+    dashboard_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Disable embedding for a dashboard.
+
+    This revokes the embed UUID and prevents the dashboard from being
+    embedded in external applications.
+
+    Args:
+        dashboard_id: The dashboard ID to disable embedding for.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+
+    return _do_mutation(
+        tool_name="disable_embedded_dashboard",
+        resource_type="dashboard",
+        action="update",
+        resource_id=dashboard_id,
+        fields_changed=["embedded"],
+        dry_run=dry_run,
+        execute=lambda: ws.delete_embedded_dashboard(dashboard_id) or {},
+    )
 
 
 # ===================================================================

@@ -1243,3 +1243,267 @@ def test_update_chart_returns_result_on_validation_timeout(monkeypatch) -> None:
     assert payload["_validation"]["status"] == "timeout"
     assert payload["_validation"]["error_type"] == "TimeoutError"
     assert "updated successfully" in payload["_validation"]["error"]
+
+
+# ===================================================================
+# Issue #40 — duplicate chart placements detection
+# ===================================================================
+
+
+def test_verify_dashboard_structure_detects_duplicate_chart_placements(monkeypatch) -> None:
+    """verify_dashboard_structure should flag when the same chart appears in
+    multiple layout nodes."""
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "dashboard_title": "Dupes",
+                "position_json": {
+                    "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+                    "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["ROW-1", "ROW-2"]},
+                    "ROW-1": {"id": "ROW-1", "type": "ROW", "children": ["CHART-A"], "parents": ["ROOT_ID", "GRID_ID"]},
+                    "ROW-2": {"id": "ROW-2", "type": "ROW", "children": ["CHART-B"], "parents": ["ROOT_ID", "GRID_ID"]},
+                    "CHART-A": {"id": "CHART-A", "type": "CHART", "children": [], "meta": {"chartId": 101}},
+                    "CHART-B": {"id": "CHART-B", "type": "CHART", "children": [], "meta": {"chartId": 101}},
+                },
+                "json_metadata": {"chartsInScope": {"101": {}}},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return [{"id": 101, "slice_name": "Volume"}]
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.verify_dashboard_structure.fn(
+        dashboard_id=80,
+        response_mode="standard",
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "warning"
+    assert len(payload["duplicate_chart_placements"]) == 1
+    assert payload["duplicate_chart_placements"][0]["chart_id"] == 101
+    assert sorted(payload["duplicate_chart_placements"][0]["layout_nodes"]) == ["CHART-A", "CHART-B"]
+
+
+def test_find_duplicate_chart_placements_no_dupes() -> None:
+    """No duplicates should return empty list."""
+    result = server._find_duplicate_chart_placements({
+        "CHART-1": {"meta": {"chartId": 1}},
+        "CHART-2": {"meta": {"chartId": 2}},
+    })
+    assert result == []
+
+
+# ===================================================================
+# Issue #41 — restore_dashboard_snapshot allow_id_mismatch
+# ===================================================================
+
+
+def test_restore_dashboard_snapshot_rejects_id_mismatch_by_default(monkeypatch, tmp_path) -> None:
+    """Without allow_id_mismatch, mismatched IDs should be rejected."""
+    snapshot = tmp_path / "dashboard_80_snap.json"
+    snapshot.write_text(json.dumps({
+        "id": 80,
+        "position_json": {
+            "DASHBOARD_VERSION_KEY": "v2",
+            "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+            "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": []},
+        },
+        "json_metadata": {},
+    }))
+
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id}
+
+        def dashboards(self):
+            return [{"id": 1}, {"id": 80}, {"id": 1}]
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError) as exc:
+        server.restore_dashboard_snapshot.fn(
+            dashboard_id=1,
+            snapshot_path=str(snapshot),
+        )
+    payload = _validation_payload(exc.value)
+    assert "allow_id_mismatch" in payload["error"]
+
+
+def test_restore_dashboard_snapshot_allows_id_mismatch(monkeypatch, tmp_path) -> None:
+    """With allow_id_mismatch=True, mismatched IDs should be accepted."""
+    snapshot = tmp_path / "dashboard_80_snap.json"
+    snapshot.write_text(json.dumps({
+        "id": 80,
+        "position_json": {
+            "DASHBOARD_VERSION_KEY": "v2",
+            "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+            "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": [], "parents": ["ROOT_ID"]},
+        },
+        "json_metadata": {"chartsInScope": {}},
+    }))
+
+    class _WS(_WorkspaceBase):
+        def __init__(self) -> None:
+            self.updated = None
+
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id}
+
+        def dashboards(self):
+            return [{"id": 1}, {"id": 80}, {"id": 1}]
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            self.updated = kwargs
+            return {"id": dashboard_id, **kwargs}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.restore_dashboard_snapshot.fn(
+        dashboard_id=1,
+        snapshot_path=str(snapshot),
+        allow_id_mismatch=True,
+    )
+    payload = json.loads(raw)
+    assert payload["id"] == 1
+    assert ws.updated is not None
+
+
+# ===================================================================
+# Issue #39 — deduplicate layout containers
+# ===================================================================
+
+
+def test_deduplicate_layout_containers_removes_duplicates() -> None:
+    """Duplicate chart nodes should be deduplicated."""
+    position = {
+        "DASHBOARD_VERSION_KEY": "v2",
+        "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+        "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["ROW-1", "ROW-2"]},
+        "ROW-1": {"id": "ROW-1", "type": "ROW", "children": ["CHART-A"]},
+        "ROW-2": {"id": "ROW-2", "type": "ROW", "children": ["CHART-B"]},
+        "CHART-A": {"id": "CHART-A", "type": "CHART", "meta": {"chartId": 101}, "children": []},
+        "CHART-B": {"id": "CHART-B", "type": "CHART", "meta": {"chartId": 101}, "children": []},
+    }
+    cleaned = server._deduplicate_layout_containers(position)
+    # CHART-A kept, CHART-B removed
+    assert "CHART-A" in cleaned
+    assert "CHART-B" not in cleaned
+    # ROW-2 should be pruned (empty wrapper after removing CHART-B)
+    assert "ROW-2" not in cleaned
+    # GRID_ID children should not reference ROW-2
+    assert "ROW-2" not in cleaned["GRID_ID"]["children"]
+
+
+def test_deduplicate_layout_containers_noop_when_no_dupes() -> None:
+    """No duplicates means position_json returned unchanged."""
+    position = {
+        "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+        "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["CHART-1"]},
+        "CHART-1": {"id": "CHART-1", "type": "CHART", "meta": {"chartId": 1}, "children": []},
+    }
+    cleaned = server._deduplicate_layout_containers(position)
+    assert cleaned == position
+
+
+def test_repair_dashboard_layout_duplicates_tool(monkeypatch) -> None:
+    """repair_dashboard_layout_duplicates should remove duplicates."""
+    _dup_position = {
+        "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+        "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["ROW-1", "ROW-2"]},
+        "ROW-1": {"id": "ROW-1", "type": "ROW", "children": ["CHART-A"]},
+        "ROW-2": {"id": "ROW-2", "type": "ROW", "children": ["CHART-B"]},
+        "CHART-A": {"id": "CHART-A", "type": "CHART", "meta": {"chartId": 101}, "children": []},
+        "CHART-B": {"id": "CHART-B", "type": "CHART", "meta": {"chartId": 101}, "children": []},
+    }
+
+    class _WS(_WorkspaceBase):
+        def __init__(self) -> None:
+            self.updated_kwargs = None
+
+        def get_resource(self, resource_type: str, resource_id: int):
+            return {"id": resource_id, "position_json": _dup_position}
+
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id, "position_json": _dup_position}
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            self.updated_kwargs = kwargs
+            return {"id": dashboard_id}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.repair_dashboard_layout_duplicates.fn(
+        dashboard_id=80,
+        dry_run=False,
+    )
+    payload = json.loads(raw)
+    assert ws.updated_kwargs is not None
+    updated_pos = json.loads(ws.updated_kwargs["position_json"])
+    assert "CHART-A" in updated_pos
+    assert "CHART-B" not in updated_pos
+
+
+# ===================================================================
+# Issue #42 — export_dashboard / import_dashboard tools
+# ===================================================================
+
+
+def test_export_dashboard_writes_zip(monkeypatch, tmp_path) -> None:
+    """export_dashboard should save a ZIP and return the path."""
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id}
+
+        def export_resource_zip(self, resource_type: str, ids: list[int]) -> bytes:
+            return b"PK\x03\x04fake_zip_content"
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    output = tmp_path / "export.zip"
+    raw = server.export_dashboard.fn(
+        dashboard_id=80,
+        output_path=str(output),
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "exported"
+    assert payload["dashboard_id"] == 80
+    assert output.exists()
+    assert output.read_bytes() == b"PK\x03\x04fake_zip_content"
+
+
+def test_import_dashboard_reads_zip(monkeypatch, tmp_path) -> None:
+    """import_dashboard should import a ZIP and return success."""
+    zip_path = tmp_path / "dashboard.zip"
+    zip_path.write_bytes(b"PK\x03\x04fake_zip")
+
+    class _WS(_WorkspaceBase):
+        def import_resource_zip(self, resource_type: str, data: bytes, overwrite: bool = False) -> bool:
+            return True
+
+        def dashboards(self):
+            return [{"id": 80}]
+
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "position_json": {
+                    "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+                    "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": []},
+                },
+            }
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.import_dashboard.fn(
+        import_path=str(zip_path),
+        overwrite=True,
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "imported"
+    assert payload["success"] is True
