@@ -1648,6 +1648,204 @@ class PresetWorkspace:
         return self._client.import_zip(resource_type, BytesIO(data), overwrite=overwrite)
 
     # ------------------------------------------------------------------
+    # Saved Queries
+    # ------------------------------------------------------------------
+
+    def saved_queries(self, **filters: Any) -> list[dict[str, Any]]:
+        """List all saved queries in the workspace."""
+        return self._client.get_resources("saved_query", **filters)
+
+    def saved_query_detail(self, query_id: int) -> dict[str, Any]:
+        """Fetch a single saved query by ID."""
+        return self._client.get_resource("saved_query", query_id)
+
+    def create_saved_query(
+        self,
+        label: str,
+        sql: str,
+        database_id: int,
+        schema: str | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new saved query."""
+        payload: dict[str, Any] = {
+            "label": label,
+            "sql": sql,
+            "db_id": database_id,
+        }
+        if schema:
+            payload["schema"] = schema
+        if description:
+            payload["description"] = description
+        return self._client.create_resource("saved_query", **payload)
+
+    def update_saved_query(self, query_id: int, **kwargs: Any) -> dict[str, Any]:
+        """Update a saved query."""
+        return self._client.update_resource("saved_query", query_id, **kwargs)
+
+    def delete_saved_query(self, query_id: int) -> None:
+        """Delete a saved query."""
+        self._client.delete_resource("saved_query", query_id)
+
+    # ------------------------------------------------------------------
+    # CSS Templates
+    # ------------------------------------------------------------------
+
+    def css_templates(self, **filters: Any) -> list[dict[str, Any]]:
+        """List all CSS templates in the workspace."""
+        return self._client.get_resources("css_template", **filters)
+
+    def css_template_detail(self, template_id: int) -> dict[str, Any]:
+        """Fetch a single CSS template by ID."""
+        return self._client.get_resource("css_template", template_id)
+
+    def create_css_template(
+        self,
+        template_name: str,
+        css: str,
+    ) -> dict[str, Any]:
+        """Create a new CSS template."""
+        return self._client.create_resource(
+            "css_template",
+            template_name=template_name,
+            css=css,
+        )
+
+    def update_css_template(self, template_id: int, **kwargs: Any) -> dict[str, Any]:
+        """Update a CSS template."""
+        return self._client.update_resource("css_template", template_id, **kwargs)
+
+    def delete_css_template(self, template_id: int) -> None:
+        """Delete a CSS template."""
+        self._client.delete_resource("css_template", template_id)
+
+    # ------------------------------------------------------------------
+    # Annotation Layers
+    # ------------------------------------------------------------------
+
+    def annotation_layers(self, **filters: Any) -> list[dict[str, Any]]:
+        """List all annotation layers in the workspace."""
+        return self._client.get_resources("annotation_layer", **filters)
+
+    def annotation_layer_detail(self, layer_id: int) -> dict[str, Any]:
+        """Fetch a single annotation layer by ID."""
+        return self._client.get_resource("annotation_layer", layer_id)
+
+    def create_annotation_layer(
+        self,
+        name: str,
+        descr: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new annotation layer."""
+        payload: dict[str, Any] = {"name": name}
+        if descr:
+            payload["descr"] = descr
+        return self._client.create_resource("annotation_layer", **payload)
+
+    def update_annotation_layer(self, layer_id: int, **kwargs: Any) -> dict[str, Any]:
+        """Update an annotation layer."""
+        return self._client.update_resource("annotation_layer", layer_id, **kwargs)
+
+    def delete_annotation_layer(self, layer_id: int) -> None:
+        """Delete an annotation layer."""
+        self._client.delete_resource("annotation_layer", layer_id)
+
+    def annotation_layer_annotations(self, layer_id: int) -> list[dict[str, Any]]:
+        """List annotations within an annotation layer."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "annotation_layer"
+            / str(layer_id) / "annotation" / ""
+        )
+        response = self._client.session.get(endpoint)
+        payload = response.json()
+        return payload.get("result", [])
+
+    def create_annotation(
+        self,
+        layer_id: int,
+        short_descr: str,
+        start_dttm: str,
+        end_dttm: str,
+        long_descr: str | None = None,
+        json_metadata: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an annotation in a layer."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "annotation_layer"
+            / str(layer_id) / "annotation" / ""
+        )
+        body: dict[str, Any] = {
+            "short_descr": short_descr,
+            "start_dttm": start_dttm,
+            "end_dttm": end_dttm,
+        }
+        if long_descr:
+            body["long_descr"] = long_descr
+        if json_metadata:
+            body["json_metadata"] = json_metadata
+        response = self._client.session.post(endpoint, json=body)
+        return response.json()
+
+    def delete_annotation(self, layer_id: int, annotation_id: int) -> None:
+        """Delete an annotation from a layer."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "annotation_layer"
+            / str(layer_id) / "annotation" / str(annotation_id)
+        )
+        self._client.session.delete(endpoint)
+
+    # ------------------------------------------------------------------
+    # Async Query Results
+    # ------------------------------------------------------------------
+
+    def async_query_result(self, query_id: str) -> dict[str, Any]:
+        """Fetch the result of an async SQL query by its query ID / key."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "sqllab" / "results"
+        )
+        response = self._client.session.get(endpoint, params={"key": query_id})
+        return response.json()
+
+    # ------------------------------------------------------------------
+    # Embedded Dashboards
+    # ------------------------------------------------------------------
+
+    def get_embedded_dashboard(self, dashboard_id: int) -> dict[str, Any] | None:
+        """Get the embedded configuration for a dashboard, if it exists."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "dashboard"
+            / str(dashboard_id) / "embedded"
+        )
+        response = self._client.session.get(endpoint)
+        if response.status_code == 404:
+            return None
+        return response.json().get("result")
+
+    def create_embedded_dashboard(
+        self,
+        dashboard_id: int,
+        allowed_domains: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Enable embedding for a dashboard and return the embed config (uuid)."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "dashboard"
+            / str(dashboard_id) / "embedded"
+        )
+        body: dict[str, Any] = {
+            "allowed_domains": allowed_domains or [],
+        }
+        response = self._client.session.post(endpoint, json=body)
+        return response.json().get("result", response.json())
+
+    def delete_embedded_dashboard(self, dashboard_id: int) -> None:
+        """Disable embedding for a dashboard."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "dashboard"
+            / str(dashboard_id) / "embedded"
+        )
+        self._client.session.delete(endpoint)
+
+    # ------------------------------------------------------------------
     # Snapshot
     # ------------------------------------------------------------------
 

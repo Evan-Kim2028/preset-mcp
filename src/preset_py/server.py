@@ -4159,6 +4159,757 @@ if _DELETE_ENABLED:
 
 
 # ===================================================================
+# Tools — Saved Queries
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def list_saved_queries(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+) -> str:
+    """List saved SQL queries in the current workspace.
+
+    Saved queries are reusable SQL snippets stored in SQL Lab.
+    Use this to discover query IDs, then pass one to get_saved_query
+    for full detail.
+
+    Args:
+        response_mode: 'compact' (id+label), 'standard' (key fields),
+                       or 'full' (raw API response).  Default: standard.
+        name_contains: Case-insensitive substring filter on the query label.
+    """
+    ws = _get_ws()
+    records = ws.saved_queries()
+    if name_contains:
+        needle = name_contains.lower()
+        records = [
+            r for r in records
+            if needle in str(r.get("label", "")).lower()
+        ]
+    if response_mode == "compact":
+        data = _pick(records, ["id", "label", "db_id"])
+    elif response_mode == "standard":
+        data = _pick(records, [
+            "id", "label", "db_id", "schema", "sql",
+            "changed_on", "description",
+        ])
+    else:
+        data = records
+    out: dict[str, Any] = {
+        "count": len(records),
+        "response_mode": response_mode,
+        "data": data,
+    }
+    if response_mode != "full":
+        out["hint"] = "Set response_mode='full' to see all fields."
+    return json.dumps(out, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def get_saved_query(
+    query_id: int,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Get detail for a single saved query.
+
+    Args:
+        query_id: The saved query ID.
+        response_mode: 'compact', 'standard', or 'full'.
+    """
+    ws = _get_ws()
+    record = ws.saved_query_detail(query_id)
+    if response_mode == "compact":
+        data = {k: record[k] for k in ["id", "label", "db_id", "schema"] if k in record}
+    elif response_mode == "standard":
+        data = {k: record[k] for k in [
+            "id", "label", "db_id", "schema", "sql",
+            "description", "changed_on",
+        ] if k in record}
+    else:
+        data = record
+    out: dict[str, Any] = {"response_mode": response_mode, "data": data}
+    if response_mode != "full":
+        out["hint"] = "Set response_mode='full' to see all fields."
+    return json.dumps(out, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def create_saved_query(
+    label: str,
+    sql: str,
+    database_id: int,
+    schema: str | None = None,
+    description: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Create a new saved SQL query in SQL Lab.
+
+    Saved queries persist reusable SQL snippets associated with a database.
+
+    Args:
+        label: Name / label for the saved query.
+        sql: The SQL text to save.
+        database_id: ID of the database this query targets.
+        schema: Optional schema context (e.g. 'public').
+        description: Optional description of the query.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    fields = ["label", "sql", "db_id"]
+    if schema:
+        fields.append("schema")
+    if description:
+        fields.append("description")
+
+    return _do_mutation(
+        tool_name="create_saved_query",
+        resource_type="saved_query",
+        action="create",
+        fields_changed=fields,
+        dry_run=dry_run,
+        execute=lambda: ws.create_saved_query(
+            label=label, sql=sql, database_id=database_id,
+            schema=schema, description=description,
+        ),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def update_saved_query(
+    query_id: int,
+    label: str | None = None,
+    sql: str | None = None,
+    description: str | None = None,
+    schema: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Update an existing saved query.
+
+    Args:
+        query_id: The saved query ID to update.
+        label: New label (name) for the query.
+        sql: New SQL text.
+        description: New description.
+        schema: New schema context.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    kwargs: dict[str, Any] = {}
+    if label is not None:
+        kwargs["label"] = label
+    if sql is not None:
+        kwargs["sql"] = sql
+    if description is not None:
+        kwargs["description"] = description
+    if schema is not None:
+        kwargs["schema"] = schema
+
+    if not kwargs:
+        raise ValueError("No fields to update. Pass at least one of: label, sql, description, schema.")
+
+    before = capture_before(ws, "saved_query", query_id)
+
+    return _do_mutation(
+        tool_name="update_saved_query",
+        resource_type="saved_query",
+        action="update",
+        resource_id=query_id,
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.update_saved_query(query_id, **kwargs),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def delete_saved_query(
+    query_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Delete a saved query.
+
+    Args:
+        query_id: The saved query ID to delete.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    before = capture_before(ws, "saved_query", query_id)
+
+    return _do_mutation(
+        tool_name="delete_saved_query",
+        resource_type="saved_query",
+        action="delete",
+        resource_id=query_id,
+        fields_changed=[],
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.delete_saved_query(query_id) or {},
+    )
+
+
+# ===================================================================
+# Tools — CSS Templates
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def list_css_templates(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+) -> str:
+    """List CSS templates in the current workspace.
+
+    CSS templates define reusable dashboard styling.  Use this to discover
+    template IDs, then pass one to get_css_template for full detail.
+
+    Args:
+        response_mode: 'compact' (id+name), 'standard' (key fields),
+                       or 'full' (raw API response).  Default: standard.
+        name_contains: Case-insensitive substring filter on template_name.
+    """
+    ws = _get_ws()
+    records = ws.css_templates()
+    if name_contains:
+        needle = name_contains.lower()
+        records = [
+            r for r in records
+            if needle in str(r.get("template_name", "")).lower()
+        ]
+    if response_mode == "compact":
+        data = _pick(records, ["id", "template_name"])
+    elif response_mode == "standard":
+        data = _pick(records, [
+            "id", "template_name", "css", "changed_on",
+        ])
+    else:
+        data = records
+    out: dict[str, Any] = {
+        "count": len(records),
+        "response_mode": response_mode,
+        "data": data,
+    }
+    if response_mode != "full":
+        out["hint"] = "Set response_mode='full' to see all fields."
+    return json.dumps(out, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def get_css_template(
+    template_id: int,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Get detail for a single CSS template.
+
+    Args:
+        template_id: The CSS template ID.
+        response_mode: 'compact', 'standard', or 'full'.
+    """
+    ws = _get_ws()
+    record = ws.css_template_detail(template_id)
+    if response_mode == "compact":
+        data = {k: record[k] for k in ["id", "template_name"] if k in record}
+    elif response_mode == "standard":
+        data = {k: record[k] for k in [
+            "id", "template_name", "css", "changed_on",
+        ] if k in record}
+    else:
+        data = record
+    out: dict[str, Any] = {"response_mode": response_mode, "data": data}
+    if response_mode != "full":
+        out["hint"] = "Set response_mode='full' to see all fields."
+    return json.dumps(out, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def create_css_template(
+    template_name: str,
+    css: str,
+    dry_run: bool = False,
+) -> str:
+    """Create a new CSS template for dashboard styling.
+
+    Args:
+        template_name: Name for the CSS template.
+        css: The CSS stylesheet text.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+
+    return _do_mutation(
+        tool_name="create_css_template",
+        resource_type="css_template",
+        action="create",
+        fields_changed=["template_name", "css"],
+        dry_run=dry_run,
+        execute=lambda: ws.create_css_template(
+            template_name=template_name, css=css,
+        ),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def update_css_template(
+    template_id: int,
+    template_name: str | None = None,
+    css: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Update an existing CSS template.
+
+    Args:
+        template_id: The CSS template ID to update.
+        template_name: New name for the template.
+        css: New CSS stylesheet text.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    kwargs: dict[str, Any] = {}
+    if template_name is not None:
+        kwargs["template_name"] = template_name
+    if css is not None:
+        kwargs["css"] = css
+
+    if not kwargs:
+        raise ValueError("No fields to update. Pass at least one of: template_name, css.")
+
+    before = capture_before(ws, "css_template", template_id)
+
+    return _do_mutation(
+        tool_name="update_css_template",
+        resource_type="css_template",
+        action="update",
+        resource_id=template_id,
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.update_css_template(template_id, **kwargs),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def delete_css_template(
+    template_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Delete a CSS template.
+
+    Args:
+        template_id: The CSS template ID to delete.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    before = capture_before(ws, "css_template", template_id)
+
+    return _do_mutation(
+        tool_name="delete_css_template",
+        resource_type="css_template",
+        action="delete",
+        resource_id=template_id,
+        fields_changed=[],
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.delete_css_template(template_id) or {},
+    )
+
+
+# ===================================================================
+# Tools — Annotation Layers
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def list_annotation_layers(
+    response_mode: ResponseMode = "standard",
+    name_contains: str | None = None,
+) -> str:
+    """List annotation layers in the current workspace.
+
+    Annotation layers let you overlay time-based markers on charts
+    (e.g. deploys, incidents).  Use this to discover layer IDs.
+
+    Args:
+        response_mode: 'compact' (id+name), 'standard' (key fields),
+                       or 'full' (raw API response).  Default: standard.
+        name_contains: Case-insensitive substring filter on layer name.
+    """
+    ws = _get_ws()
+    records = ws.annotation_layers()
+    if name_contains:
+        needle = name_contains.lower()
+        records = [
+            r for r in records
+            if needle in str(r.get("name", "")).lower()
+        ]
+    if response_mode == "compact":
+        data = _pick(records, ["id", "name"])
+    elif response_mode == "standard":
+        data = _pick(records, [
+            "id", "name", "descr", "changed_on",
+        ])
+    else:
+        data = records
+    out: dict[str, Any] = {
+        "count": len(records),
+        "response_mode": response_mode,
+        "data": data,
+    }
+    if response_mode != "full":
+        out["hint"] = "Set response_mode='full' to see all fields."
+    return json.dumps(out, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def get_annotation_layer(
+    layer_id: int,
+    response_mode: ResponseMode = "standard",
+) -> str:
+    """Get detail for a single annotation layer including its annotations.
+
+    Args:
+        layer_id: The annotation layer ID.
+        response_mode: 'compact', 'standard', or 'full'.
+    """
+    ws = _get_ws()
+    record = ws.annotation_layer_detail(layer_id)
+    annotations = ws.annotation_layer_annotations(layer_id)
+
+    if response_mode == "compact":
+        data = {k: record[k] for k in ["id", "name"] if k in record}
+        data["annotation_count"] = len(annotations)
+    elif response_mode == "standard":
+        data = {k: record[k] for k in [
+            "id", "name", "descr", "changed_on",
+        ] if k in record}
+        data["annotations"] = [
+            {k: a[k] for k in ["id", "short_descr", "start_dttm", "end_dttm"] if k in a}
+            for a in annotations
+        ]
+    else:
+        data = record
+        data["annotations"] = annotations
+    out: dict[str, Any] = {"response_mode": response_mode, "data": data}
+    if response_mode != "full":
+        out["hint"] = "Set response_mode='full' to see all fields."
+    return json.dumps(out, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def create_annotation_layer(
+    name: str,
+    descr: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Create a new annotation layer.
+
+    Annotation layers group time-based annotations that can be overlaid
+    on time-series charts.  After creating a layer, use create_annotation
+    to add individual annotations.
+
+    Args:
+        name: Name for the annotation layer.
+        descr: Optional description.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    fields = ["name"]
+    if descr:
+        fields.append("descr")
+
+    return _do_mutation(
+        tool_name="create_annotation_layer",
+        resource_type="annotation_layer",
+        action="create",
+        fields_changed=fields,
+        dry_run=dry_run,
+        execute=lambda: ws.create_annotation_layer(name=name, descr=descr),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def update_annotation_layer(
+    layer_id: int,
+    name: str | None = None,
+    descr: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Update an existing annotation layer.
+
+    Args:
+        layer_id: The annotation layer ID to update.
+        name: New name for the layer.
+        descr: New description.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    kwargs: dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if descr is not None:
+        kwargs["descr"] = descr
+
+    if not kwargs:
+        raise ValueError("No fields to update. Pass at least one of: name, descr.")
+
+    before = capture_before(ws, "annotation_layer", layer_id)
+
+    return _do_mutation(
+        tool_name="update_annotation_layer",
+        resource_type="annotation_layer",
+        action="update",
+        resource_id=layer_id,
+        fields_changed=list(kwargs.keys()),
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.update_annotation_layer(layer_id, **kwargs),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def delete_annotation_layer(
+    layer_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Delete an annotation layer and all its annotations.
+
+    Args:
+        layer_id: The annotation layer ID to delete.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    before = capture_before(ws, "annotation_layer", layer_id)
+
+    return _do_mutation(
+        tool_name="delete_annotation_layer",
+        resource_type="annotation_layer",
+        action="delete",
+        resource_id=layer_id,
+        fields_changed=[],
+        dry_run=dry_run,
+        before=before,
+        execute=lambda: ws.delete_annotation_layer(layer_id) or {},
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def create_annotation(
+    layer_id: int,
+    short_descr: str,
+    start_dttm: str,
+    end_dttm: str,
+    long_descr: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Add an annotation to an existing annotation layer.
+
+    Annotations are time-based markers that overlay on time-series charts.
+    Use list_annotation_layers or get_annotation_layer to find layer IDs.
+
+    Args:
+        layer_id: The annotation layer ID to add this annotation to.
+        short_descr: Short description (label) shown on the chart overlay.
+        start_dttm: Start datetime in ISO 8601 format (e.g. '2024-01-15T00:00:00').
+        end_dttm: End datetime in ISO 8601 format (e.g. '2024-01-16T00:00:00').
+        long_descr: Optional longer description with details.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    fields = ["short_descr", "start_dttm", "end_dttm"]
+    if long_descr:
+        fields.append("long_descr")
+
+    return _do_mutation(
+        tool_name="create_annotation",
+        resource_type="annotation",
+        action="create",
+        fields_changed=fields,
+        dry_run=dry_run,
+        execute=lambda: ws.create_annotation(
+            layer_id=layer_id,
+            short_descr=short_descr,
+            start_dttm=start_dttm,
+            end_dttm=end_dttm,
+            long_descr=long_descr,
+        ),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def delete_annotation(
+    layer_id: int,
+    annotation_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Delete a specific annotation from an annotation layer.
+
+    Args:
+        layer_id: The annotation layer ID.
+        annotation_id: The annotation ID to delete.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+
+    return _do_mutation(
+        tool_name="delete_annotation",
+        resource_type="annotation",
+        action="delete",
+        resource_id=annotation_id,
+        fields_changed=[],
+        dry_run=dry_run,
+        execute=lambda: ws.delete_annotation(layer_id, annotation_id) or {},
+    )
+
+
+# ===================================================================
+# Tools — Async Query Results
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def get_async_query_result(
+    query_id: str,
+) -> str:
+    """Fetch results of an async SQL query by its query ID (key).
+
+    When SQL Lab runs a query asynchronously, it returns a query ID
+    (also called a 'key').  Use this tool to poll for and retrieve
+    the results once the query completes.
+
+    Args:
+        query_id: The query ID / key returned by an async SQL Lab query.
+    """
+    ws = _get_ws()
+    result = ws.async_query_result(query_id)
+    return json.dumps(result, indent=2, default=str)
+
+
+# ===================================================================
+# Tools — Embedded Dashboards
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def get_embedded_dashboard(
+    dashboard_id: int,
+) -> str:
+    """Get the embedded configuration for a dashboard.
+
+    Returns the embedding UUID and allowed domains if embedding is enabled,
+    or indicates that embedding is not configured.
+
+    Args:
+        dashboard_id: The dashboard ID.
+    """
+    ws = _get_ws()
+    result = ws.get_embedded_dashboard(dashboard_id)
+    if result is None:
+        return json.dumps({
+            "dashboard_id": dashboard_id,
+            "embedded": False,
+            "hint": "Use enable_embedded_dashboard to enable embedding.",
+        }, indent=2)
+    return json.dumps({
+        "dashboard_id": dashboard_id,
+        "embedded": True,
+        "data": result,
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def enable_embedded_dashboard(
+    dashboard_id: int,
+    allowed_domains: list[str] | str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Enable embedding for a dashboard and return its embed UUID.
+
+    The returned UUID is used to embed the dashboard in external
+    applications via the Superset embedded SDK.
+
+    Args:
+        dashboard_id: The dashboard ID to enable embedding for.
+        allowed_domains: List of domains allowed to embed (e.g.
+                         '["app.example.com"]').  Pass an empty list to
+                         allow all origins.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+    domains: list[str] = []
+    if isinstance(allowed_domains, str):
+        try:
+            parsed = json.loads(allowed_domains)
+            if isinstance(parsed, list):
+                domains = [str(d) for d in parsed]
+            else:
+                domains = [str(allowed_domains)]
+        except (json.JSONDecodeError, TypeError):
+            domains = [d.strip() for d in allowed_domains.split(",") if d.strip()]
+    elif isinstance(allowed_domains, list):
+        domains = [str(d) for d in allowed_domains]
+
+    return _do_mutation(
+        tool_name="enable_embedded_dashboard",
+        resource_type="dashboard",
+        action="update",
+        resource_id=dashboard_id,
+        fields_changed=["embedded", "allowed_domains"],
+        dry_run=dry_run,
+        execute=lambda: ws.create_embedded_dashboard(
+            dashboard_id=dashboard_id,
+            allowed_domains=domains,
+        ),
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def disable_embedded_dashboard(
+    dashboard_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Disable embedding for a dashboard.
+
+    This revokes the embed UUID and prevents the dashboard from being
+    embedded in external applications.
+
+    Args:
+        dashboard_id: The dashboard ID to disable embedding for.
+        dry_run: If True, preview the action without executing.
+    """
+    ws = _get_ws()
+
+    return _do_mutation(
+        tool_name="disable_embedded_dashboard",
+        resource_type="dashboard",
+        action="update",
+        resource_id=dashboard_id,
+        fields_changed=["embedded"],
+        dry_run=dry_run,
+        execute=lambda: ws.delete_embedded_dashboard(dashboard_id) or {},
+    )
+
+
+# ===================================================================
 # Entry point
 # ===================================================================
 
