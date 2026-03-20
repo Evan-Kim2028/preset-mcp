@@ -4277,8 +4277,7 @@ def get_annotation_layer(
             for a in annotations
         ]
     else:
-        data = record
-        data["annotations"] = annotations
+        data = {**record, "annotations": annotations}
     out: dict[str, Any] = {"response_mode": response_mode, "data": data}
     if response_mode != "full":
         out["hint"] = "Set response_mode='full' to see all fields."
