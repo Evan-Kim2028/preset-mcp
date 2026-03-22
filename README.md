@@ -42,7 +42,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 
 ```bash
 claude mcp list
-# Should show: preset-mcp  ... 33 tools
+# Should show: preset-mcp  ... 63 tools
 ```
 
 Then in a Claude Code session, try:
