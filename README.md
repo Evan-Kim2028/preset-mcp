@@ -63,7 +63,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
   preset-mcp -- uv run --directory /path/to/preset-mcp preset-mcp
 ```
 
-## Tools (33)
+## Tools (63)
 
 ### Workspace Navigation
 
@@ -101,6 +101,14 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 | `update_dataset` | Change a dataset's SQL, name, or description |
 | `update_chart` | Change a chart's title, viz type, or parameters |
 | `update_dashboard` | Rename or publish/unpublish a dashboard |
+
+### Dashboard Lifecycle
+
+| Tool | Purpose |
+|------|---------|
+| `export_dashboard` | Export a dashboard ZIP bundle for backup or migration |
+| `import_dashboard` | Import a dashboard ZIP bundle and report affected dashboard IDs |
+| `delete_dashboard` | Delete a dashboard after exporting a backup ZIP |
 
 ### SQL & Query
 

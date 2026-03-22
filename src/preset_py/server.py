@@ -491,6 +491,13 @@ def _require_dashboards_exist(ws: PresetWorkspace, dashboard_ids: list[int]) -> 
         )
 
 
+def _dashboard_id_from_export_path(path: Path) -> int | None:
+    match = re.match(r"^dashboard_(\d+)_", path.name)
+    if match is None:
+        return None
+    return _to_int(match.group(1))
+
+
 _viz_type_cache: dict[str, tuple[set[str], float]] = {}
 _VIZ_TYPE_CACHE_TTL = 300  # seconds
 
@@ -3873,6 +3880,214 @@ def restore_dashboard_snapshot(
             "allow_id_mismatch": allow_id_mismatch,
         },
     )
+
+
+# ===================================================================
+# Tools — Dashboard lifecycle
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def export_dashboard(
+    dashboard_id: int,
+    output_path: str | None = None,
+) -> str:
+    """Export a dashboard ZIP bundle for backup or migration."""
+    ws = _get_ws()
+    _require_dashboards_exist(ws, [dashboard_id])
+
+    zip_bytes = ws.export_resource_zip("dashboard", [dashboard_id])
+    if output_path:
+        dest = Path(output_path).expanduser()
+    else:
+        exports_dir = AUDIT_DIR / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = exports_dir / f"dashboard_{dashboard_id}_{ts}.zip"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(zip_bytes)
+
+    record_mutation(MutationEntry(
+        tool_name="export_dashboard",
+        resource_type="dashboard",
+        resource_id=dashboard_id,
+        action="create",
+        after_summary={
+            "export_path": str(dest),
+            "size_bytes": len(zip_bytes),
+        },
+    ))
+
+    return json.dumps({
+        "status": "exported",
+        "dashboard_id": dashboard_id,
+        "export_path": str(dest),
+        "size_bytes": len(zip_bytes),
+    }, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def import_dashboard(
+    import_path: str,
+    overwrite: bool = False,
+    repair_duplicate_layout: bool = True,
+    verify_after_import: bool = True,
+) -> str:
+    """Import a dashboard ZIP bundle and report the affected dashboard IDs."""
+    ws = _get_ws()
+    path = Path(import_path).expanduser()
+    if not path.exists():
+        raise ValueError(f"Import file not found: {import_path}")
+
+    before_dashboards = ws.dashboards()
+    before_ids = {
+        dashboard_id
+        for dashboard_id in (_to_int(d.get("id")) for d in before_dashboards)
+        if dashboard_id is not None
+    }
+
+    data = path.read_bytes()
+    success = ws.import_resource_zip("dashboard", data, overwrite=overwrite)
+
+    after_dashboards = ws.dashboards()
+    after_by_id = {
+        dashboard_id: dashboard
+        for dashboard in after_dashboards
+        for dashboard_id in [_to_int(dashboard.get("id"))]
+        if dashboard_id is not None
+    }
+    after_ids = set(after_by_id)
+    new_dashboard_ids = sorted(after_ids - before_ids)
+
+    source_dashboard_id = _dashboard_id_from_export_path(path)
+    imported_dashboard_ids = list(new_dashboard_ids)
+    if (
+        overwrite
+        and not imported_dashboard_ids
+        and source_dashboard_id is not None
+        and source_dashboard_id in after_ids
+    ):
+        imported_dashboard_ids = [source_dashboard_id]
+
+    imported_dashboards = [
+        {
+            "id": dashboard_id,
+            "dashboard_title": after_by_id[dashboard_id].get("dashboard_title"),
+        }
+        for dashboard_id in imported_dashboard_ids
+    ]
+
+    dashboard_details: dict[int, dict[str, Any]] = {}
+    repaired_dashboards: list[dict[str, Any]] = []
+    if repair_duplicate_layout:
+        for dashboard_id in imported_dashboard_ids:
+            detail = ws.dashboard_detail(dashboard_id)
+            dashboard_details[dashboard_id] = detail
+            position = _ensure_json_dict(detail.get("position_json", {}), "position_json")
+            duplicate_chart_placements = _find_duplicate_chart_placements(position)
+            if not duplicate_chart_placements:
+                continue
+
+            cleaned = _deduplicate_layout_containers(position)
+            ws.update_dashboard(
+                dashboard_id,
+                position_json=json.dumps(cleaned),
+            )
+            repaired_dashboards.append({
+                "dashboard_id": dashboard_id,
+                "duplicate_chart_count": len(duplicate_chart_placements),
+            })
+            updated_detail = dict(detail)
+            updated_detail["position_json"] = cleaned
+            dashboard_details[dashboard_id] = updated_detail
+
+    structure_checks: list[dict[str, Any]] = []
+    if verify_after_import:
+        for dashboard_id in imported_dashboard_ids:
+            detail = dashboard_details.get(dashboard_id)
+            if detail is None:
+                detail = ws.dashboard_detail(dashboard_id)
+                dashboard_details[dashboard_id] = detail
+            charts = ws.dashboard_charts(dashboard_id)
+            report = _dashboard_structure_report(
+                detail.get("position_json", {}),
+                detail.get("json_metadata", {}),
+                charts,
+            )
+            structure_checks.append({
+                "dashboard_id": dashboard_id,
+                "status": report.get("status"),
+                "duplicate_chart_count": len(report.get("duplicate_chart_placements", [])),
+                "layout_orphan_count": len(report.get("layout_orphans", [])),
+                "scope_orphan_count": len(report.get("scope_orphans", [])),
+            })
+
+    after_summary: dict[str, Any] = {
+        "import_path": str(path),
+        "overwrite": overwrite,
+        "success": success,
+        "new_dashboard_ids": new_dashboard_ids,
+    }
+    if source_dashboard_id is not None:
+        after_summary["source_dashboard_id"] = source_dashboard_id
+    if repaired_dashboards:
+        after_summary["repaired_dashboards"] = repaired_dashboards
+
+    record_mutation(MutationEntry(
+        tool_name="import_dashboard",
+        resource_type="dashboard",
+        action="create",
+        after_summary=after_summary,
+    ))
+
+    response: dict[str, Any] = {
+        "status": "imported",
+        "import_path": str(path),
+        "overwrite": overwrite,
+        "success": success,
+        "new_dashboard_ids": new_dashboard_ids,
+        "imported_dashboards": imported_dashboards,
+    }
+    if source_dashboard_id is not None:
+        response["source_dashboard_id"] = source_dashboard_id
+    if source_dashboard_id is not None and len(imported_dashboard_ids) == 1:
+        response["id_changed"] = imported_dashboard_ids[0] != source_dashboard_id
+    if repaired_dashboards:
+        response["repaired_dashboards"] = repaired_dashboards
+    if structure_checks:
+        response["structure_checks"] = structure_checks
+    if not imported_dashboard_ids:
+        response["warning"] = (
+            "Import succeeded but the imported dashboard id could not be identified "
+            "from the current workspace state."
+        )
+    return json.dumps(response, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def delete_dashboard(dashboard_id: int, dry_run: bool = False) -> str:
+    """Delete a dashboard after exporting a full backup."""
+    ws = _get_ws()
+    before = capture_before(ws, "dashboard", dashboard_id)
+    ep = export_before_delete(ws, "dashboard", dashboard_id)
+
+    return _do_mutation(
+        tool_name="delete_dashboard",
+        resource_type="dashboard",
+        action="delete",
+        fields_changed=[],
+        dry_run=dry_run,
+        execute=lambda: ws.delete_resource("dashboard", dashboard_id) or {},
+        resource_id=dashboard_id,
+        before=before,
+        export_path=ep,
+    )
+
+
 # ===================================================================
 # Tools — Delete operations (opt-in via PRESET_MCP_ENABLE_DELETE)
 # ===================================================================
@@ -3882,38 +4097,6 @@ _DELETE_ENABLED = os.environ.get("PRESET_MCP_ENABLE_DELETE", "").lower() in (
 )
 
 if _DELETE_ENABLED:
-
-    @mcp.tool()
-    @_handle_errors
-    def delete_dashboard(dashboard_id: int, dry_run: bool = False) -> str:
-        """Delete a dashboard after exporting a full backup.
-
-        A ZIP backup is saved to ~/.preset-mcp/audit/exports/ BEFORE the
-        delete proceeds.  If the export fails, the dashboard is NOT deleted.
-
-        Requires PRESET_MCP_ENABLE_DELETE=true to be available.
-
-        Args:
-            dashboard_id: ID of the dashboard to delete
-            dry_run: If True, export backup and return preview without
-                     actually deleting (default: False)
-        """
-        ws = _get_ws()
-        before = capture_before(ws, "dashboard", dashboard_id)
-        ep = export_before_delete(ws, "dashboard", dashboard_id)
-
-        return _do_mutation(
-            tool_name="delete_dashboard",
-            resource_type="dashboard",
-            action="delete",
-            fields_changed=[],
-            dry_run=dry_run,
-            execute=lambda: ws.delete_resource("dashboard", dashboard_id) or {},
-            resource_id=dashboard_id,
-            before=before,
-            export_path=ep,
-        )
-
     @mcp.tool()
     @_handle_errors
     def delete_chart(chart_id: int, dry_run: bool = False) -> str:
