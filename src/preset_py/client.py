@@ -618,6 +618,38 @@ def _chart_data_error_message(body: Any) -> str:
     return error_message
 
 
+def _api_error_message(body: Any) -> str:
+    """Translate generic API error payloads into a stable error message."""
+    messages: list[str] = []
+    if isinstance(body, dict):
+        for key in ("message", "error", "detail"):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                messages.append(value.strip())
+            elif value not in (None, ""):
+                messages.append(json.dumps(value, default=str))
+
+        errors = body.get("errors")
+        if isinstance(errors, list):
+            for item in errors:
+                if isinstance(item, dict):
+                    value = item.get("message") or item.get("error") or item.get("detail")
+                    if value:
+                        messages.append(str(value))
+                elif item not in (None, ""):
+                    messages.append(str(item))
+    elif isinstance(body, list):
+        for item in body:
+            if item not in (None, ""):
+                messages.append(str(item))
+    elif body not in (None, ""):
+        messages.append(str(body))
+
+    if not messages:
+        return "Preset API request failed with an empty API error payload."
+    return " | ".join(dict.fromkeys(messages))
+
+
 def _infer_dataset_time_column(dataset: dict[str, Any]) -> str | None:
     """Infer a default datetime column when exactly one exists."""
     raw_columns = dataset.get("columns")
@@ -804,6 +836,66 @@ class PresetWorkspace:
                 "or pass a workspace name to connect()."
             )
         return self._superset
+
+    def _request_json(
+        self,
+        method: Literal["get", "post", "put", "delete"],
+        endpoint: str,
+        operation: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        allow_404: bool = False,
+    ) -> dict[str, Any]:
+        request = getattr(self._client.session, method)
+        kwargs: dict[str, Any] = {}
+        if params is not None:
+            kwargs["params"] = params
+        if json_body is not None:
+            kwargs["json"] = json_body
+
+        response = request(endpoint, **kwargs)
+        if allow_404 and response.status_code == 404:
+            return {}
+
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise ValueError(
+                f"{operation} received a non-JSON response (HTTP {response.status_code})."
+            ) from exc
+
+        if response.status_code < 200 or response.status_code >= 300:
+            raise ValueError(f"{operation} failed: {_api_error_message(body)}")
+        if not isinstance(body, dict):
+            raise ValueError(f"{operation} received malformed API response.")
+        return body
+
+    def _request_ok(
+        self,
+        method: Literal["delete", "post", "put"],
+        endpoint: str,
+        operation: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+    ) -> None:
+        request = getattr(self._client.session, method)
+        kwargs: dict[str, Any] = {}
+        if json_body is not None:
+            kwargs["json"] = json_body
+
+        response = request(endpoint, **kwargs)
+        if 200 <= response.status_code < 300:
+            return
+
+        try:
+            body = response.json()
+        except Exception:
+            text = response.text[:400] if getattr(response, "text", "") else "non-JSON response"
+            raise ValueError(
+                f"{operation} failed with HTTP {response.status_code}: {text}"
+            )
+        raise ValueError(f"{operation} failed: {_api_error_message(body)}")
 
     # ------------------------------------------------------------------
     # Workspace navigation
@@ -1756,9 +1848,15 @@ class PresetWorkspace:
             self._client.baseurl / "api/v1" / "annotation_layer"
             / str(layer_id) / "annotation" / ""
         )
-        response = self._client.session.get(endpoint)
-        payload = response.json()
-        return payload.get("result", [])
+        payload = self._request_json(
+            "get",
+            endpoint,
+            f"List annotations for annotation layer {layer_id}",
+        )
+        result = payload.get("result", [])
+        if not isinstance(result, list):
+            raise ValueError("List annotations received malformed API response.")
+        return result
 
     def create_annotation(
         self,
@@ -1783,8 +1881,16 @@ class PresetWorkspace:
             body["long_descr"] = long_descr
         if json_metadata:
             body["json_metadata"] = json_metadata
-        response = self._client.session.post(endpoint, json=body)
-        return response.json()
+        payload = self._request_json(
+            "post",
+            endpoint,
+            f"Create annotation in layer {layer_id}",
+            json_body=body,
+        )
+        result = payload.get("result", payload)
+        if not isinstance(result, dict):
+            raise ValueError("Create annotation received malformed API response.")
+        return result
 
     def delete_annotation(self, layer_id: int, annotation_id: int) -> None:
         """Delete an annotation from a layer."""
@@ -1792,7 +1898,11 @@ class PresetWorkspace:
             self._client.baseurl / "api/v1" / "annotation_layer"
             / str(layer_id) / "annotation" / str(annotation_id)
         )
-        self._client.session.delete(endpoint)
+        self._request_ok(
+            "delete",
+            endpoint,
+            f"Delete annotation {annotation_id} from layer {layer_id}",
+        )
 
     # ------------------------------------------------------------------
     # Async Query Results
@@ -1803,8 +1913,12 @@ class PresetWorkspace:
         endpoint = str(
             self._client.baseurl / "api/v1" / "sqllab" / "results"
         )
-        response = self._client.session.get(endpoint, params={"key": query_id})
-        return response.json()
+        return self._request_json(
+            "get",
+            endpoint,
+            f"Fetch async query result {query_id}",
+            params={"key": query_id},
+        )
 
     # ------------------------------------------------------------------
     # Embedded Dashboards
@@ -1816,10 +1930,20 @@ class PresetWorkspace:
             self._client.baseurl / "api/v1" / "dashboard"
             / str(dashboard_id) / "embedded"
         )
-        response = self._client.session.get(endpoint)
-        if response.status_code == 404:
+        payload = self._request_json(
+            "get",
+            endpoint,
+            f"Fetch embedded dashboard configuration for dashboard {dashboard_id}",
+            allow_404=True,
+        )
+        if not payload:
             return None
-        return response.json().get("result")
+        result = payload.get("result", payload)
+        if not isinstance(result, dict):
+            raise ValueError(
+                "Fetch embedded dashboard configuration received malformed API response."
+            )
+        return result
 
     def create_embedded_dashboard(
         self,
@@ -1834,8 +1958,16 @@ class PresetWorkspace:
         body: dict[str, Any] = {
             "allowed_domains": allowed_domains or [],
         }
-        response = self._client.session.post(endpoint, json=body)
-        return response.json().get("result", response.json())
+        payload = self._request_json(
+            "post",
+            endpoint,
+            f"Enable embedding for dashboard {dashboard_id}",
+            json_body=body,
+        )
+        result = payload.get("result", payload)
+        if not isinstance(result, dict):
+            raise ValueError("Enable embedding received malformed API response.")
+        return result
 
     def delete_embedded_dashboard(self, dashboard_id: int) -> None:
         """Disable embedding for a dashboard."""
@@ -1843,7 +1975,11 @@ class PresetWorkspace:
             self._client.baseurl / "api/v1" / "dashboard"
             / str(dashboard_id) / "embedded"
         )
-        self._client.session.delete(endpoint)
+        self._request_ok(
+            "delete",
+            endpoint,
+            f"Disable embedding for dashboard {dashboard_id}",
+        )
 
     # ------------------------------------------------------------------
     # Snapshot
