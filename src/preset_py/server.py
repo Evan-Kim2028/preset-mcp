@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from difflib import get_close_matches
 from collections.abc import Callable
@@ -657,6 +658,232 @@ def _extract_position_chart_refs(position_json: Any) -> dict[str, int]:
     return refs
 
 
+_LAYOUT_WRAPPER_TYPES = frozenset({"ROW", "COLUMN", "TAB", "TABS"})
+
+
+def _find_duplicate_chart_placements(position_json: Any) -> list[dict[str, Any]]:
+    """Return duplicate chart placements keyed by chart_id."""
+    refs = _extract_position_chart_refs(position_json)
+    chart_to_nodes: dict[int, list[str]] = {}
+    for node_id, chart_id in refs.items():
+        chart_to_nodes.setdefault(chart_id, []).append(node_id)
+    return [
+        {"chart_id": chart_id, "layout_nodes": sorted(node_ids)}
+        for chart_id, node_ids in sorted(chart_to_nodes.items())
+        if len(node_ids) > 1
+    ]
+
+
+def _reachable_layout_node_ids(position_json: Any) -> set[str]:
+    payload = _ensure_json_dict(position_json, "position_json")
+    nodes = {
+        str(node_id): node
+        for node_id, node in payload.items()
+        if isinstance(node, dict)
+    }
+    queue: deque[str] = deque(["ROOT_ID"] if "ROOT_ID" in nodes else [])
+    reachable: set[str] = set()
+    while queue:
+        current = queue.popleft()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        children = nodes.get(current, {}).get("children")
+        if not isinstance(children, list):
+            continue
+        for child in children:
+            child_id = str(child)
+            if child_id in nodes and child_id not in reachable:
+                queue.append(child_id)
+    return reachable
+
+
+def _layout_preorder_index(position_json: Any) -> dict[str, int]:
+    payload = _ensure_json_dict(position_json, "position_json")
+    nodes = {
+        str(node_id): node
+        for node_id, node in payload.items()
+        if isinstance(node, dict)
+    }
+    order: dict[str, int] = {}
+    stack: list[str] = ["ROOT_ID"] if "ROOT_ID" in nodes else []
+    while stack:
+        current = stack.pop()
+        if current in order:
+            continue
+        order[current] = len(order)
+        children = nodes.get(current, {}).get("children")
+        if not isinstance(children, list):
+            continue
+        for child in reversed(children):
+            child_id = str(child)
+            if child_id in nodes and child_id not in order:
+                stack.append(child_id)
+    for node_id in sorted(nodes):
+        if node_id not in order:
+            order[node_id] = len(order)
+    return order
+
+
+def _layout_descendant_chart_ids(position_json: Any) -> dict[str, tuple[int, ...]]:
+    payload = _ensure_json_dict(position_json, "position_json")
+    nodes = {
+        str(node_id): node
+        for node_id, node in payload.items()
+        if isinstance(node, dict)
+    }
+    chart_refs = _extract_position_chart_refs(payload)
+    cache: dict[str, tuple[int, ...]] = {}
+    visiting: set[str] = set()
+
+    def collect(node_id: str) -> tuple[int, ...]:
+        if node_id in cache:
+            return cache[node_id]
+        if node_id in visiting:
+            return tuple()
+        visiting.add(node_id)
+        if node_id in chart_refs:
+            result = (chart_refs[node_id],)
+        else:
+            charts: list[int] = []
+            children = nodes.get(node_id, {}).get("children")
+            if isinstance(children, list):
+                for child in children:
+                    child_id = str(child)
+                    if child_id in nodes:
+                        charts.extend(collect(child_id))
+            result = tuple(charts)
+        visiting.remove(node_id)
+        cache[node_id] = result
+        return result
+
+    for node_id in nodes:
+        collect(node_id)
+    return cache
+
+
+def _remove_layout_nodes(
+    position_json: dict[str, Any],
+    nodes_to_remove: set[str],
+) -> dict[str, Any]:
+    if not nodes_to_remove:
+        return position_json
+
+    cleaned: dict[str, Any] = {}
+    for node_id, node in position_json.items():
+        node_key = str(node_id)
+        if isinstance(node, dict) and node_key in nodes_to_remove:
+            continue
+        if isinstance(node, dict):
+            updated = dict(node)
+            children = node.get("children")
+            if isinstance(children, list):
+                updated["children"] = [
+                    child for child in children
+                    if str(child) not in nodes_to_remove
+                ]
+            parents = node.get("parents")
+            if isinstance(parents, list):
+                updated["parents"] = [
+                    parent for parent in parents
+                    if str(parent) not in nodes_to_remove
+                ]
+            cleaned[node_id] = updated
+        else:
+            cleaned[node_id] = node
+    return cleaned
+
+
+def _prune_unreachable_layout_nodes(position_json: dict[str, Any]) -> dict[str, Any]:
+    reachable = _reachable_layout_node_ids(position_json)
+    if not reachable:
+        return position_json
+    nodes_to_remove = {
+        str(node_id)
+        for node_id, node in position_json.items()
+        if isinstance(node, dict) and str(node_id) not in reachable
+    }
+    return _remove_layout_nodes(position_json, nodes_to_remove)
+
+
+def _prune_empty_layout_wrappers(position_json: dict[str, Any]) -> dict[str, Any]:
+    cleaned = position_json
+    while True:
+        empty_wrappers: set[str] = set()
+        for node_id, node in cleaned.items():
+            if not isinstance(node, dict):
+                continue
+            node_key = str(node_id)
+            if node_key in ("ROOT_ID", "GRID_ID"):
+                continue
+            if str(node.get("type", "")) not in _LAYOUT_WRAPPER_TYPES:
+                continue
+            children = node.get("children")
+            if children is None:
+                children = []
+            if isinstance(children, list) and not children:
+                empty_wrappers.add(node_key)
+        if not empty_wrappers:
+            return cleaned
+        cleaned = _remove_layout_nodes(cleaned, empty_wrappers)
+        cleaned = _prune_unreachable_layout_nodes(cleaned)
+
+
+def _deduplicate_layout_containers(position_json: dict[str, Any]) -> dict[str, Any]:
+    """Remove duplicate layout subtrees while preserving the first visible copy."""
+    if not position_json:
+        return position_json
+
+    cleaned = dict(position_json)
+    reachable = _reachable_layout_node_ids(cleaned)
+    preorder = _layout_preorder_index(cleaned)
+    descendant_charts = _layout_descendant_chart_ids(cleaned)
+    chart_nodes = _extract_position_chart_refs(cleaned)
+
+    duplicate_wrappers: dict[tuple[str, tuple[int, ...]], list[str]] = {}
+    for node_id in reachable:
+        node = cleaned.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        if node_id in ("ROOT_ID", "GRID_ID") or node_id in chart_nodes:
+            continue
+        node_type = str(node.get("type", ""))
+        if node_type not in _LAYOUT_WRAPPER_TYPES:
+            continue
+        signature = descendant_charts.get(node_id, tuple())
+        if not signature:
+            continue
+        duplicate_wrappers.setdefault((node_type, signature), []).append(node_id)
+
+    wrapper_nodes_to_remove: set[str] = set()
+    for node_ids in duplicate_wrappers.values():
+        if len(node_ids) <= 1:
+            continue
+        ordered = sorted(node_ids, key=lambda node_id: preorder.get(node_id, len(preorder)))
+        wrapper_nodes_to_remove.update(ordered[1:])
+
+    if wrapper_nodes_to_remove:
+        cleaned = _remove_layout_nodes(cleaned, wrapper_nodes_to_remove)
+        cleaned = _prune_unreachable_layout_nodes(cleaned)
+        cleaned = _prune_empty_layout_wrappers(cleaned)
+
+    duplicate_chart_nodes: set[str] = set()
+    preorder = _layout_preorder_index(cleaned)
+    for duplicate in _find_duplicate_chart_placements(cleaned):
+        ordered = sorted(
+            duplicate["layout_nodes"],
+            key=lambda node_id: preorder.get(node_id, len(preorder)),
+        )
+        duplicate_chart_nodes.update(ordered[1:])
+
+    if duplicate_chart_nodes:
+        cleaned = _remove_layout_nodes(cleaned, duplicate_chart_nodes)
+        cleaned = _prune_unreachable_layout_nodes(cleaned)
+        cleaned = _prune_empty_layout_wrappers(cleaned)
+
+    return cleaned
+
+
 def _extract_scope_chart_refs(json_metadata: Any) -> set[int]:
     payload = _ensure_json_dict(json_metadata, "json_metadata")
     charts_in_scope = payload.get("chartsInScope")
@@ -893,20 +1120,7 @@ def _dashboard_structure_report(
                         "child_parents": sorted(normalized_parents),
                     })
 
-    reachable: set[str] = set()
-    queue: list[str] = ["ROOT_ID"] if "ROOT_ID" in nodes else []
-    while queue:
-        current = queue.pop(0)
-        if current in reachable:
-            continue
-        reachable.add(current)
-        children = nodes.get(current, {}).get("children")
-        if not isinstance(children, list):
-            continue
-        for child in children:
-            child_id = str(child)
-            if child_id in nodes and child_id not in reachable:
-                queue.append(child_id)
+    reachable = _reachable_layout_node_ids(position)
 
     unreachable_nodes = sorted(
         node_id for node_id in nodes.keys()
@@ -920,6 +1134,7 @@ def _dashboard_structure_report(
     }
     layout_chart_ids = set(_extract_position_chart_refs(position).values())
     scope_chart_ids = _extract_scope_chart_refs(metadata)
+    duplicate_chart_placements = _find_duplicate_chart_placements(position)
 
     layout_orphans = sorted(layout_chart_ids - attached_chart_ids)
     scope_orphans = sorted(scope_chart_ids - attached_chart_ids)
@@ -942,6 +1157,7 @@ def _dashboard_structure_report(
         or layout_orphans
         or scope_orphans
         or attached_missing_layout
+        or duplicate_chart_placements
     ):
         status = "warning"
 
@@ -963,6 +1179,7 @@ def _dashboard_structure_report(
         "layout_orphans": layout_orphans,
         "scope_orphans": scope_orphans,
         "attached_missing_layout": attached_missing_layout,
+        "duplicate_chart_placements": duplicate_chart_placements,
     }
 
 
@@ -2484,6 +2701,7 @@ def verify_dashboard_structure(
             "dangling_child_count": len(report.get("dangling_children", [])),
             "missing_id_count": len(report.get("missing_id_nodes", [])),
             "missing_type_count": len(report.get("missing_type_nodes", [])),
+            "duplicate_chart_count": len(report.get("duplicate_chart_placements", [])),
         }, indent=2, default=str)
 
     if response_mode == "standard":
@@ -2500,6 +2718,7 @@ def verify_dashboard_structure(
             "layout_orphans": report.get("layout_orphans"),
             "scope_orphans": report.get("scope_orphans"),
             "attached_missing_layout": report.get("attached_missing_layout"),
+            "duplicate_chart_placements": report.get("duplicate_chart_placements"),
         }, indent=2, default=str)
 
     return json.dumps({
@@ -3422,6 +3641,57 @@ def repair_dashboard_chart_refs(
     )
 
 
+@mcp.tool()
+@_handle_errors
+def repair_dashboard_layout_duplicates(
+    dashboard_id: int,
+    dry_run: bool = False,
+) -> str:
+    """Remove duplicate chart placements from a dashboard layout."""
+    ws = _get_ws()
+    before = capture_before(ws, "dashboard", dashboard_id)
+    if "_snapshot_error" in before:
+        raise ValueError(
+            f"Dashboard {dashboard_id} not found. Use list_dashboards to find valid IDs."
+        )
+
+    position = _ensure_json_dict(before.get("position_json", {}), "position_json")
+    duplicate_chart_placements = _find_duplicate_chart_placements(position)
+    if not duplicate_chart_placements:
+        return json.dumps({
+            "status": "noop",
+            "dashboard_id": dashboard_id,
+            "duplicate_chart_placements": [],
+            "message": "No duplicate chart placements found.",
+        }, indent=2, default=str)
+
+    cleaned = _deduplicate_layout_containers(position)
+
+    return _do_mutation(
+        tool_name="repair_dashboard_layout_duplicates",
+        resource_type="dashboard",
+        action="update",
+        fields_changed=["position_json"],
+        dry_run=dry_run,
+        execute=lambda: ws.update_dashboard(
+            dashboard_id,
+            position_json=json.dumps(cleaned),
+        ),
+        resource_id=dashboard_id,
+        before=before,
+        preview_extras={
+            "duplicate_chart_placements": duplicate_chart_placements,
+            "nodes_before": len(position),
+            "nodes_after": len(cleaned),
+        },
+        result_extras={
+            "duplicate_chart_placements_fixed": duplicate_chart_placements,
+            "nodes_before": len(position),
+            "nodes_after": len(cleaned),
+        },
+    )
+
+
 # ===================================================================
 # Tools — Snapshot
 # ===================================================================
@@ -3561,6 +3831,7 @@ def restore_dashboard_snapshot(
     dashboard_id: int,
     snapshot_path: str,
     restore_json_metadata: bool = True,
+    allow_id_mismatch: bool = False,
     dry_run: bool = False,
 ) -> str:
     """Restore dashboard layout/settings from a local snapshot JSON file."""
@@ -3581,10 +3852,12 @@ def restore_dashboard_snapshot(
 
     snap_dashboard_id = _to_int(snapshot.get("id"))
     if snap_dashboard_id is not None and snap_dashboard_id != dashboard_id:
-        raise ValueError(
-            f"Snapshot dashboard id {snap_dashboard_id} does not match requested "
-            f"dashboard_id {dashboard_id}."
-        )
+        if not allow_id_mismatch:
+            raise ValueError(
+                f"Snapshot dashboard id {snap_dashboard_id} does not match requested "
+                f"dashboard_id {dashboard_id}. Pass allow_id_mismatch=True to "
+                "restore this snapshot into a different dashboard."
+            )
 
     restored_position = _ensure_json_dict(snapshot.get("position_json"), "position_json")
     _validate_position_layout(restored_position)
@@ -3608,6 +3881,7 @@ def restore_dashboard_snapshot(
         preview_extras={
             "snapshot_path": str(path),
             "restore_json_metadata": restore_json_metadata,
+            "allow_id_mismatch": allow_id_mismatch,
         },
         result_extras={
             "_restored_from_snapshot": str(path),
@@ -3615,6 +3889,7 @@ def restore_dashboard_snapshot(
         after_extras={
             "snapshot_path": str(path),
             "restore_json_metadata": restore_json_metadata,
+            "allow_id_mismatch": allow_id_mismatch,
         },
     )
 
