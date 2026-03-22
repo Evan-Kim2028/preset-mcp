@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.7.2 - 2026-03-22
+
+### Added
+- First-class dashboard lifecycle tools:
+  - `export_dashboard`
+  - `import_dashboard`
+  - `delete_dashboard`
+- Added Preset resource-management tools for saved queries, CSS templates,
+  annotation layers, async query inspection, and embedded dashboards.
+
+### Fixed
+- Dashboard-import repair now only mutates dashboards created or updated by
+  the import, and dashboard structure checks now flag duplicate chart
+  placements more reliably.
+- `restore_dashboard_snapshot` can now target recreated dashboards whose ids
+  changed after replacement or re-import.
+- Preset resource API helpers now surface non-2xx failures instead of
+  silently returning success-shaped payloads.
+- Fixed annotation-layer mutation handling and expanded regression coverage for
+  the new resource tools.
+
+### Improved
+- MCP tool responses now use compact JSON payloads and omit repeated
+  `response_mode` / hint echoes to reduce token overhead.
+- The packaged MCP surface now exposes 63 tools.
+
+## 0.7.1 - 2026-03-17
+
+### Fixed
+- `create_chart` / `update_chart` now preserve the synthetic `query_context`
+  metadata needed for downstream validation and follow-up inspection.
+- Reduced redundant Preset API calls with batching/caching optimizations in
+  chart and dataset operations.
+
+### Quality
+- Added regression coverage for query-context persistence and the API-call
+  reduction paths introduced in the `0.7.1` patch release.
+
 ## 0.7.0 - 2026-03-10
 
 ### Fixed
