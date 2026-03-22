@@ -618,6 +618,38 @@ def _chart_data_error_message(body: Any) -> str:
     return error_message
 
 
+def _api_error_message(body: Any) -> str:
+    """Translate generic API error payloads into a stable error message."""
+    messages: list[str] = []
+    if isinstance(body, dict):
+        for key in ("message", "error", "detail"):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                messages.append(value.strip())
+            elif value not in (None, ""):
+                messages.append(json.dumps(value, default=str))
+
+        errors = body.get("errors")
+        if isinstance(errors, list):
+            for item in errors:
+                if isinstance(item, dict):
+                    value = item.get("message") or item.get("error") or item.get("detail")
+                    if value:
+                        messages.append(str(value))
+                elif item not in (None, ""):
+                    messages.append(str(item))
+    elif isinstance(body, list):
+        for item in body:
+            if item not in (None, ""):
+                messages.append(str(item))
+    elif body not in (None, ""):
+        messages.append(str(body))
+
+    if not messages:
+        return "Preset API request failed with an empty API error payload."
+    return " | ".join(dict.fromkeys(messages))
+
+
 def _infer_dataset_time_column(dataset: dict[str, Any]) -> str | None:
     """Infer a default datetime column when exactly one exists."""
     raw_columns = dataset.get("columns")
@@ -804,6 +836,66 @@ class PresetWorkspace:
                 "or pass a workspace name to connect()."
             )
         return self._superset
+
+    def _request_json(
+        self,
+        method: Literal["get", "post", "put", "delete"],
+        endpoint: str,
+        operation: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        allow_404: bool = False,
+    ) -> dict[str, Any]:
+        request = getattr(self._client.session, method)
+        kwargs: dict[str, Any] = {}
+        if params is not None:
+            kwargs["params"] = params
+        if json_body is not None:
+            kwargs["json"] = json_body
+
+        response = request(endpoint, **kwargs)
+        if allow_404 and response.status_code == 404:
+            return {}
+
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise ValueError(
+                f"{operation} received a non-JSON response (HTTP {response.status_code})."
+            ) from exc
+
+        if response.status_code < 200 or response.status_code >= 300:
+            raise ValueError(f"{operation} failed: {_api_error_message(body)}")
+        if not isinstance(body, dict):
+            raise ValueError(f"{operation} received malformed API response.")
+        return body
+
+    def _request_ok(
+        self,
+        method: Literal["delete", "post", "put"],
+        endpoint: str,
+        operation: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+    ) -> None:
+        request = getattr(self._client.session, method)
+        kwargs: dict[str, Any] = {}
+        if json_body is not None:
+            kwargs["json"] = json_body
+
+        response = request(endpoint, **kwargs)
+        if 200 <= response.status_code < 300:
+            return
+
+        try:
+            body = response.json()
+        except Exception:
+            text = response.text[:400] if getattr(response, "text", "") else "non-JSON response"
+            raise ValueError(
+                f"{operation} failed with HTTP {response.status_code}: {text}"
+            )
+        raise ValueError(f"{operation} failed: {_api_error_message(body)}")
 
     # ------------------------------------------------------------------
     # Workspace navigation
@@ -1646,6 +1738,248 @@ class PresetWorkspace:
     def import_resource_zip(self, resource_type: str, data: bytes, overwrite: bool = False) -> bool:
         from io import BytesIO
         return self._client.import_zip(resource_type, BytesIO(data), overwrite=overwrite)
+
+    # ------------------------------------------------------------------
+    # Saved Queries
+    # ------------------------------------------------------------------
+
+    def saved_queries(self, **filters: Any) -> list[dict[str, Any]]:
+        """List all saved queries in the workspace."""
+        return self._client.get_resources("saved_query", **filters)
+
+    def saved_query_detail(self, query_id: int) -> dict[str, Any]:
+        """Fetch a single saved query by ID."""
+        return self._client.get_resource("saved_query", query_id)
+
+    def create_saved_query(
+        self,
+        label: str,
+        sql: str,
+        database_id: int,
+        schema: str | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new saved query."""
+        payload: dict[str, Any] = {
+            "label": label,
+            "sql": sql,
+            "db_id": database_id,
+        }
+        if schema:
+            payload["schema"] = schema
+        if description:
+            payload["description"] = description
+        return self._client.create_resource("saved_query", **payload)
+
+    def update_saved_query(self, query_id: int, **kwargs: Any) -> dict[str, Any]:
+        """Update a saved query."""
+        return self._client.update_resource("saved_query", query_id, **kwargs)
+
+    def delete_saved_query(self, query_id: int) -> None:
+        """Delete a saved query."""
+        self._client.delete_resource("saved_query", query_id)
+
+    # ------------------------------------------------------------------
+    # CSS Templates
+    # ------------------------------------------------------------------
+
+    def css_templates(self, **filters: Any) -> list[dict[str, Any]]:
+        """List all CSS templates in the workspace."""
+        return self._client.get_resources("css_template", **filters)
+
+    def css_template_detail(self, template_id: int) -> dict[str, Any]:
+        """Fetch a single CSS template by ID."""
+        return self._client.get_resource("css_template", template_id)
+
+    def create_css_template(
+        self,
+        template_name: str,
+        css: str,
+    ) -> dict[str, Any]:
+        """Create a new CSS template."""
+        return self._client.create_resource(
+            "css_template",
+            template_name=template_name,
+            css=css,
+        )
+
+    def update_css_template(self, template_id: int, **kwargs: Any) -> dict[str, Any]:
+        """Update a CSS template."""
+        return self._client.update_resource("css_template", template_id, **kwargs)
+
+    def delete_css_template(self, template_id: int) -> None:
+        """Delete a CSS template."""
+        self._client.delete_resource("css_template", template_id)
+
+    # ------------------------------------------------------------------
+    # Annotation Layers
+    # ------------------------------------------------------------------
+
+    def annotation_layers(self, **filters: Any) -> list[dict[str, Any]]:
+        """List all annotation layers in the workspace."""
+        return self._client.get_resources("annotation_layer", **filters)
+
+    def annotation_layer_detail(self, layer_id: int) -> dict[str, Any]:
+        """Fetch a single annotation layer by ID."""
+        return self._client.get_resource("annotation_layer", layer_id)
+
+    def create_annotation_layer(
+        self,
+        name: str,
+        descr: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new annotation layer."""
+        payload: dict[str, Any] = {"name": name}
+        if descr:
+            payload["descr"] = descr
+        return self._client.create_resource("annotation_layer", **payload)
+
+    def update_annotation_layer(self, layer_id: int, **kwargs: Any) -> dict[str, Any]:
+        """Update an annotation layer."""
+        return self._client.update_resource("annotation_layer", layer_id, **kwargs)
+
+    def delete_annotation_layer(self, layer_id: int) -> None:
+        """Delete an annotation layer."""
+        self._client.delete_resource("annotation_layer", layer_id)
+
+    def annotation_layer_annotations(self, layer_id: int) -> list[dict[str, Any]]:
+        """List annotations within an annotation layer."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "annotation_layer"
+            / str(layer_id) / "annotation" / ""
+        )
+        payload = self._request_json(
+            "get",
+            endpoint,
+            f"List annotations for annotation layer {layer_id}",
+        )
+        result = payload.get("result", [])
+        if not isinstance(result, list):
+            raise ValueError("List annotations received malformed API response.")
+        return result
+
+    def create_annotation(
+        self,
+        layer_id: int,
+        short_descr: str,
+        start_dttm: str,
+        end_dttm: str,
+        long_descr: str | None = None,
+        json_metadata: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an annotation in a layer."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "annotation_layer"
+            / str(layer_id) / "annotation" / ""
+        )
+        body: dict[str, Any] = {
+            "short_descr": short_descr,
+            "start_dttm": start_dttm,
+            "end_dttm": end_dttm,
+        }
+        if long_descr:
+            body["long_descr"] = long_descr
+        if json_metadata:
+            body["json_metadata"] = json_metadata
+        payload = self._request_json(
+            "post",
+            endpoint,
+            f"Create annotation in layer {layer_id}",
+            json_body=body,
+        )
+        result = payload.get("result", payload)
+        if not isinstance(result, dict):
+            raise ValueError("Create annotation received malformed API response.")
+        return result
+
+    def delete_annotation(self, layer_id: int, annotation_id: int) -> None:
+        """Delete an annotation from a layer."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "annotation_layer"
+            / str(layer_id) / "annotation" / str(annotation_id)
+        )
+        self._request_ok(
+            "delete",
+            endpoint,
+            f"Delete annotation {annotation_id} from layer {layer_id}",
+        )
+
+    # ------------------------------------------------------------------
+    # Async Query Results
+    # ------------------------------------------------------------------
+
+    def async_query_result(self, query_id: str) -> dict[str, Any]:
+        """Fetch the result of an async SQL query by its query ID / key."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "sqllab" / "results"
+        )
+        return self._request_json(
+            "get",
+            endpoint,
+            f"Fetch async query result {query_id}",
+            params={"key": query_id},
+        )
+
+    # ------------------------------------------------------------------
+    # Embedded Dashboards
+    # ------------------------------------------------------------------
+
+    def get_embedded_dashboard(self, dashboard_id: int) -> dict[str, Any] | None:
+        """Get the embedded configuration for a dashboard, if it exists."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "dashboard"
+            / str(dashboard_id) / "embedded"
+        )
+        payload = self._request_json(
+            "get",
+            endpoint,
+            f"Fetch embedded dashboard configuration for dashboard {dashboard_id}",
+            allow_404=True,
+        )
+        if not payload:
+            return None
+        result = payload.get("result", payload)
+        if not isinstance(result, dict):
+            raise ValueError(
+                "Fetch embedded dashboard configuration received malformed API response."
+            )
+        return result
+
+    def create_embedded_dashboard(
+        self,
+        dashboard_id: int,
+        allowed_domains: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Enable embedding for a dashboard and return the embed config (uuid)."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "dashboard"
+            / str(dashboard_id) / "embedded"
+        )
+        body: dict[str, Any] = {
+            "allowed_domains": allowed_domains or [],
+        }
+        payload = self._request_json(
+            "post",
+            endpoint,
+            f"Enable embedding for dashboard {dashboard_id}",
+            json_body=body,
+        )
+        result = payload.get("result", payload)
+        if not isinstance(result, dict):
+            raise ValueError("Enable embedding received malformed API response.")
+        return result
+
+    def delete_embedded_dashboard(self, dashboard_id: int) -> None:
+        """Disable embedding for a dashboard."""
+        endpoint = str(
+            self._client.baseurl / "api/v1" / "dashboard"
+            / str(dashboard_id) / "embedded"
+        )
+        self._request_ok(
+            "delete",
+            endpoint,
+            f"Disable embedding for dashboard {dashboard_id}",
+        )
 
     # ------------------------------------------------------------------
     # Snapshot

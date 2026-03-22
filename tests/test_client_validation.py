@@ -7,7 +7,7 @@ from preset_py.client import PresetWorkspace, _critical_page_errors
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, body: dict):
+    def __init__(self, status_code: int, body):
         self.status_code = status_code
         self._body = body
         self.text = json.dumps(body)
@@ -20,9 +20,17 @@ class _FakeSession:
     def __init__(self, response: _FakeResponse):
         self._response = response
         self.last_payload = None
+        self.last_params = None
 
     def post(self, _endpoint: str, json=None):
         self.last_payload = json
+        return self._response
+
+    def get(self, _endpoint: str, params=None):
+        self.last_params = params
+        return self._response
+
+    def delete(self, _endpoint: str):
         return self._response
 
 
@@ -335,3 +343,90 @@ def test_validate_chart_does_not_persist_when_existing_query_context_used() -> N
     ws.validate_chart_data(7, dashboard_id=None, persist_synthetic=True)
 
     assert client.update_chart_calls == []
+
+
+def test_get_embedded_dashboard_returns_none_on_404() -> None:
+    response = _FakeResponse(404, {"message": "Not found"})
+    client = _FakeSupersetClient(response)
+    ws = PresetWorkspace.__new__(PresetWorkspace)
+    ws._superset = client
+
+    assert ws.get_embedded_dashboard(44) is None
+
+
+def test_get_embedded_dashboard_raises_on_api_error() -> None:
+    response = _FakeResponse(500, {"message": "embed fetch failed"})
+    client = _FakeSupersetClient(response)
+    ws = PresetWorkspace.__new__(PresetWorkspace)
+    ws._superset = client
+
+    with pytest.raises(ValueError, match="embed fetch failed"):
+        ws.get_embedded_dashboard(44)
+
+
+def test_delete_embedded_dashboard_raises_on_api_error() -> None:
+    response = _FakeResponse(500, {"error": "delete failed"})
+    client = _FakeSupersetClient(response)
+    ws = PresetWorkspace.__new__(PresetWorkspace)
+    ws._superset = client
+
+    with pytest.raises(ValueError, match="delete failed"):
+        ws.delete_embedded_dashboard(44)
+
+
+def test_create_annotation_unwraps_result_payload() -> None:
+    response = _FakeResponse(201, {"result": {"id": 8, "short_descr": "Release"}})
+    client = _FakeSupersetClient(response)
+    ws = PresetWorkspace.__new__(PresetWorkspace)
+    ws._superset = client
+
+    created = ws.create_annotation(
+        layer_id=9,
+        short_descr="Release",
+        start_dttm="2026-03-01",
+        end_dttm="2026-03-02",
+        long_descr="launch",
+    )
+
+    assert created["id"] == 8
+    assert client.session.last_payload == {
+        "short_descr": "Release",
+        "start_dttm": "2026-03-01",
+        "end_dttm": "2026-03-02",
+        "long_descr": "launch",
+    }
+
+
+def test_create_annotation_raises_on_api_error() -> None:
+    response = _FakeResponse(400, {"message": "invalid annotation"})
+    client = _FakeSupersetClient(response)
+    ws = PresetWorkspace.__new__(PresetWorkspace)
+    ws._superset = client
+
+    with pytest.raises(ValueError, match="invalid annotation"):
+        ws.create_annotation(
+            layer_id=9,
+            short_descr="Release",
+            start_dttm="2026-03-01",
+            end_dttm="2026-03-02",
+        )
+
+
+def test_delete_annotation_raises_on_api_error() -> None:
+    response = _FakeResponse(500, {"error": "annotation delete failed"})
+    client = _FakeSupersetClient(response)
+    ws = PresetWorkspace.__new__(PresetWorkspace)
+    ws._superset = client
+
+    with pytest.raises(ValueError, match="annotation delete failed"):
+        ws.delete_annotation(9, 8)
+
+
+def test_async_query_result_raises_on_api_error() -> None:
+    response = _FakeResponse(500, {"message": "query failed"})
+    client = _FakeSupersetClient(response)
+    ws = PresetWorkspace.__new__(PresetWorkspace)
+    ws._superset = client
+
+    with pytest.raises(ValueError, match="query failed"):
+        ws.async_query_result("01JABC")
