@@ -197,7 +197,7 @@ def test_update_saved_query_execute(monkeypatch) -> None:
     raw = server.update_saved_query.fn(
         query_id=1, label="Updated label",
     )
-    payload = json.loads(raw)
+    json.loads(raw)
     assert ws.update_id == 1
     assert ws.update_kwargs == {"label": "Updated label"}
 
@@ -382,7 +382,7 @@ def test_update_css_template_execute(monkeypatch) -> None:
     raw = server.update_css_template.fn(
         template_id=1, css="body { color: red; }",
     )
-    payload = json.loads(raw)
+    json.loads(raw)
     assert ws.update_id == 1
     assert ws.update_kwargs == {"css": "body { color: red; }"}
 
@@ -584,7 +584,7 @@ def test_update_annotation_layer_execute(monkeypatch) -> None:
     monkeypatch.setattr(server, "record_mutation", lambda entry: None)
     monkeypatch.setattr(server, "capture_before", lambda ws, rt, rid: {"id": rid})
     raw = server.update_annotation_layer.fn(layer_id=1, name="Renamed")
-    payload = json.loads(raw)
+    json.loads(raw)
     assert ws.update_layer_id == 1
     assert ws.update_layer_kwargs == {"name": "Renamed"}
 
@@ -822,7 +822,7 @@ def test_enable_embedded_dashboard_with_json_string(monkeypatch) -> None:
         dashboard_id=42,
         allowed_domains='["app.example.com"]',
     )
-    payload = json.loads(raw)
+    json.loads(raw)
     assert ws.enable_domains == ["app.example.com"]
 
 
@@ -834,7 +834,7 @@ def test_enable_embedded_dashboard_with_comma_string(monkeypatch) -> None:
         dashboard_id=42,
         allowed_domains="app.example.com, staging.example.com",
     )
-    payload = json.loads(raw)
+    json.loads(raw)
     assert ws.enable_domains == ["app.example.com", "staging.example.com"]
 
 
@@ -843,7 +843,7 @@ def test_enable_embedded_dashboard_with_none(monkeypatch) -> None:
     monkeypatch.setattr(server, "_get_ws", lambda: ws)
     monkeypatch.setattr(server, "record_mutation", lambda entry: None)
     raw = server.enable_embedded_dashboard.fn(dashboard_id=42)
-    payload = json.loads(raw)
+    json.loads(raw)
     assert ws.enable_domains == []
 
 
@@ -867,7 +867,7 @@ def test_disable_embedded_dashboard_execute(monkeypatch) -> None:
     monkeypatch.setattr(server, "_get_ws", lambda: ws)
     monkeypatch.setattr(server, "record_mutation", lambda entry: None)
     raw = server.disable_embedded_dashboard.fn(dashboard_id=80)
-    payload = json.loads(raw)
+    json.loads(raw)
     assert ws.disable_dashboard_id == 80
 
 
