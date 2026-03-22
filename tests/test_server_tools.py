@@ -681,6 +681,152 @@ def test_restore_dashboard_snapshot_allows_mismatched_dashboard_id(monkeypatch, 
     assert ws.updated is not None
 
 
+def test_export_dashboard_writes_zip_bundle(monkeypatch, tmp_path) -> None:
+    output_path = tmp_path / "yield_dashboard.zip"
+
+    class _WS(_WorkspaceBase):
+        def export_resource_zip(self, resource_type: str, ids: list[int]):
+            assert resource_type == "dashboard"
+            assert ids == [80]
+            return b"zip-bytes"
+
+        def dashboards(self):
+            return [{"id": 80, "dashboard_title": "Yield"}]
+
+    recorded: list[object] = []
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    monkeypatch.setattr(server, "record_mutation", lambda entry: recorded.append(entry))
+
+    raw = server.export_dashboard.fn(
+        dashboard_id=80,
+        output_path=str(output_path),
+    )
+    payload = json.loads(raw)
+
+    assert output_path.read_bytes() == b"zip-bytes"
+    assert payload["status"] == "exported"
+    assert payload["dashboard_id"] == 80
+    assert payload["export_path"] == str(output_path)
+    assert payload["size_bytes"] == len(b"zip-bytes")
+    assert recorded
+
+
+def test_import_dashboard_repairs_new_dashboard_and_reports_id_change(monkeypatch, tmp_path) -> None:
+    import_path = tmp_path / "dashboard_80_20260322T120000Z.zip"
+    import_path.write_bytes(b"zip-bytes")
+
+    duplicate_position = {
+        "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+        "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["ROW-1", "ROW-2"], "parents": ["ROOT_ID"]},
+        "ROW-1": {"id": "ROW-1", "type": "ROW", "children": ["CHART-A"], "parents": ["GRID_ID"]},
+        "ROW-2": {"id": "ROW-2", "type": "ROW", "children": ["CHART-B"], "parents": ["GRID_ID"]},
+        "CHART-A": {"id": "CHART-A", "type": "CHART", "meta": {"chartId": 101}, "children": [], "parents": ["ROW-1"]},
+        "CHART-B": {"id": "CHART-B", "type": "CHART", "meta": {"chartId": 101}, "children": [], "parents": ["ROW-2"]},
+    }
+
+    class _WS(_WorkspaceBase):
+        def __init__(self) -> None:
+            self.imported = False
+            self.updated_position_json: str | None = None
+
+        def dashboards(self):
+            if not self.imported:
+                return [{"id": 80, "dashboard_title": "Yield"}]
+            return [
+                {"id": 80, "dashboard_title": "Yield"},
+                {"id": 81, "dashboard_title": "Yield"},
+            ]
+
+        def import_resource_zip(self, resource_type: str, data: bytes, overwrite: bool = False):
+            assert resource_type == "dashboard"
+            assert data == b"zip-bytes"
+            assert overwrite is False
+            self.imported = True
+            return True
+
+        def dashboard_detail(self, dashboard_id: int):
+            if dashboard_id != 81:
+                raise AssertionError(f"unexpected dashboard id: {dashboard_id}")
+            position_json = duplicate_position
+            if self.updated_position_json is not None:
+                position_json = json.loads(self.updated_position_json)
+            return {
+                "id": dashboard_id,
+                "dashboard_title": "Yield",
+                "position_json": position_json,
+                "json_metadata": {},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            assert dashboard_id == 81
+            return [{"id": 101, "slice_name": "Yield Chart"}]
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            assert dashboard_id == 81
+            self.updated_position_json = str(kwargs["position_json"])
+            return {"id": dashboard_id}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.import_dashboard.fn(
+        import_path=str(import_path),
+        overwrite=False,
+        repair_duplicate_layout=True,
+        verify_after_import=True,
+    )
+    payload = json.loads(raw)
+
+    assert payload["status"] == "imported"
+    assert payload["success"] is True
+    assert payload["source_dashboard_id"] == 80
+    assert payload["new_dashboard_ids"] == [81]
+    assert payload["imported_dashboards"] == [{"id": 81, "dashboard_title": "Yield"}]
+    assert payload["id_changed"] is True
+    assert payload["repaired_dashboards"] == [
+        {"dashboard_id": 81, "duplicate_chart_count": 1}
+    ]
+    assert payload["structure_checks"] == [
+        {
+            "dashboard_id": 81,
+            "status": "success",
+            "duplicate_chart_count": 0,
+            "layout_orphan_count": 0,
+            "scope_orphan_count": 0,
+        }
+    ]
+
+    assert ws.updated_position_json is not None
+    updated_position = json.loads(ws.updated_position_json)
+    assert updated_position["GRID_ID"]["children"] == ["ROW-1"]
+
+
+def test_delete_dashboard_is_available_without_delete_flag(monkeypatch, tmp_path) -> None:
+    export_path = tmp_path / "dashboard_80_backup.zip"
+
+    class _WS(_WorkspaceBase):
+        def __init__(self) -> None:
+            self.deleted: list[tuple[str, int]] = []
+
+        def delete_resource(self, resource_type: str, resource_id: int):
+            self.deleted.append((resource_type, resource_id))
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "capture_before", lambda ws, rt, rid: {"id": rid})
+    monkeypatch.setattr(server, "export_before_delete", lambda ws, rt, rid: export_path)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.delete_dashboard.fn(dashboard_id=80, dry_run=True)
+    payload = json.loads(raw)
+
+    assert payload["dry_run"] is True
+    assert payload["dashboard_id"] == 80
+    assert payload["export_path"] == str(export_path)
+    assert ws.deleted == []
+
+
 def test_list_dashboard_snapshots_filters_by_dashboard(monkeypatch, tmp_path) -> None:
     snapshots = tmp_path / "snapshots"
     snapshots.mkdir(parents=True, exist_ok=True)
