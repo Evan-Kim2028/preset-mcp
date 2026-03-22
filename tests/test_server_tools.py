@@ -597,6 +597,90 @@ def test_restore_dashboard_snapshot_updates_layout(monkeypatch, tmp_path) -> Non
     assert "json_metadata" in ws.updated
 
 
+def test_restore_dashboard_snapshot_rejects_mismatched_dashboard_id(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "dashboard_80_20260304T120000Z.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "id": 80,
+                "position_json": {
+                    "DASHBOARD_VERSION_KEY": "v2",
+                    "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+                    "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": [], "parents": ["ROOT_ID"]},
+                },
+                "json_metadata": {"chartsInScope": {}},
+            }
+        )
+    )
+
+    class _WS(_WorkspaceBase):
+        def dashboards(self):
+            return [{"id": 80}, {"id": 81}]
+
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id}
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+
+    with pytest.raises(ToolError) as exc:
+        server.restore_dashboard_snapshot.fn(
+            dashboard_id=81,
+            snapshot_path=str(snapshot),
+            restore_json_metadata=True,
+        )
+    payload = _validation_payload(exc.value)
+    assert "allow_id_mismatch=True" in payload["error"]
+
+
+def test_restore_dashboard_snapshot_allows_mismatched_dashboard_id(monkeypatch, tmp_path) -> None:
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshot = snapshots / "dashboard_80_20260304T120000Z.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "id": 80,
+                "position_json": {
+                    "DASHBOARD_VERSION_KEY": "v2",
+                    "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+                    "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": [], "parents": ["ROOT_ID"]},
+                },
+                "json_metadata": {"chartsInScope": {}},
+            }
+        )
+    )
+
+    class _WS(_WorkspaceBase):
+        def __init__(self) -> None:
+            self.updated = None
+
+        def dashboards(self):
+            return [{"id": 80}, {"id": 81}]
+
+        def dashboard_detail(self, dashboard_id: int):
+            return {"id": dashboard_id}
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            self.updated = kwargs
+            return {"id": dashboard_id, **kwargs}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.restore_dashboard_snapshot.fn(
+        dashboard_id=81,
+        snapshot_path=str(snapshot),
+        restore_json_metadata=True,
+        allow_id_mismatch=True,
+    )
+    payload = json.loads(raw)
+    assert payload["id"] == 81
+    assert ws.updated is not None
+
+
 def test_list_dashboard_snapshots_filters_by_dashboard(monkeypatch, tmp_path) -> None:
     snapshots = tmp_path / "snapshots"
     snapshots.mkdir(parents=True, exist_ok=True)
@@ -669,6 +753,38 @@ def test_verify_dashboard_structure_detects_layout_issues(monkeypatch) -> None:
     assert payload["status"] == "failed"
     assert payload["dangling_children"]
     assert payload["scope_orphans"] == [999]
+
+
+def test_verify_dashboard_structure_detects_duplicate_chart_placements(monkeypatch) -> None:
+    class _WS(_WorkspaceBase):
+        def dashboard_detail(self, dashboard_id: int):
+            return {
+                "id": dashboard_id,
+                "dashboard_title": "Duplicate Layout",
+                "position_json": {
+                    "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+                    "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["ROW-1", "ROW-2"], "parents": ["ROOT_ID"]},
+                    "ROW-1": {"id": "ROW-1", "type": "ROW", "children": ["CHART-A"], "parents": ["GRID_ID"]},
+                    "ROW-2": {"id": "ROW-2", "type": "ROW", "children": ["CHART-B"], "parents": ["GRID_ID"]},
+                    "CHART-A": {"id": "CHART-A", "type": "CHART", "meta": {"chartId": 101}, "children": [], "parents": ["ROW-1"]},
+                    "CHART-B": {"id": "CHART-B", "type": "CHART", "meta": {"chartId": 101}, "children": [], "parents": ["ROW-2"]},
+                },
+                "json_metadata": {},
+            }
+
+        def dashboard_charts(self, dashboard_id: int):
+            return [{"id": 101, "slice_name": "Volume"}]
+
+    monkeypatch.setattr(server, "_get_ws", lambda: _WS())
+    raw = server.verify_dashboard_structure.fn(
+        dashboard_id=80,
+        response_mode="standard",
+    )
+    payload = json.loads(raw)
+    assert payload["status"] == "warning"
+    assert payload["duplicate_chart_placements"] == [
+        {"chart_id": 101, "layout_nodes": ["CHART-A", "CHART-B"]}
+    ]
 
 
 def test_verify_dashboard_workflow_reports_failed_query(monkeypatch) -> None:
@@ -952,6 +1068,72 @@ def test_verify_dashboard_structure_detects_missing_node_ids(monkeypatch) -> Non
     assert "ROOT_ID" in payload["missing_id_nodes"]
     assert "GRID_ID" in payload["missing_id_nodes"]
     assert "GRID_ID" in payload["missing_type_nodes"]
+
+
+# ===================================================================
+# Issues #39 / #40 / #41 — duplicate layout repair + snapshot portability
+# ===================================================================
+
+
+def test_deduplicate_layout_containers_removes_duplicate_row_subtree_without_mixing_layout() -> None:
+    position = {
+        "DASHBOARD_VERSION_KEY": "v2",
+        "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+        "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["ROW-ORIG", "ROW-DUPE"], "parents": ["ROOT_ID"]},
+        "ROW-ORIG": {"id": "ROW-ORIG", "type": "ROW", "children": ["CHART-Z1", "CHART-A2"], "parents": ["GRID_ID"]},
+        "ROW-DUPE": {"id": "ROW-DUPE", "type": "ROW", "children": ["CHART-A1", "CHART-Z2"], "parents": ["GRID_ID"]},
+        "CHART-Z1": {"id": "CHART-Z1", "type": "CHART", "meta": {"chartId": 1}, "children": [], "parents": ["ROW-ORIG"]},
+        "CHART-A2": {"id": "CHART-A2", "type": "CHART", "meta": {"chartId": 2}, "children": [], "parents": ["ROW-ORIG"]},
+        "CHART-A1": {"id": "CHART-A1", "type": "CHART", "meta": {"chartId": 1}, "children": [], "parents": ["ROW-DUPE"]},
+        "CHART-Z2": {"id": "CHART-Z2", "type": "CHART", "meta": {"chartId": 2}, "children": [], "parents": ["ROW-DUPE"]},
+    }
+
+    cleaned = server._deduplicate_layout_containers(position)
+
+    assert cleaned["GRID_ID"]["children"] == ["ROW-ORIG"]
+    assert cleaned["ROW-ORIG"]["children"] == ["CHART-Z1", "CHART-A2"]
+    assert "ROW-DUPE" not in cleaned
+    assert "CHART-A1" not in cleaned
+    assert "CHART-Z2" not in cleaned
+
+
+def test_repair_dashboard_layout_duplicates_updates_dashboard(monkeypatch) -> None:
+    duplicate_position = {
+        "ROOT_ID": {"id": "ROOT_ID", "type": "ROOT", "children": ["GRID_ID"]},
+        "GRID_ID": {"id": "GRID_ID", "type": "GRID", "children": ["ROW-ORIG", "ROW-DUPE"], "parents": ["ROOT_ID"]},
+        "ROW-ORIG": {"id": "ROW-ORIG", "type": "ROW", "children": ["CHART-Z1", "CHART-A2"], "parents": ["GRID_ID"]},
+        "ROW-DUPE": {"id": "ROW-DUPE", "type": "ROW", "children": ["CHART-A1", "CHART-Z2"], "parents": ["GRID_ID"]},
+        "CHART-Z1": {"id": "CHART-Z1", "type": "CHART", "meta": {"chartId": 1}, "children": [], "parents": ["ROW-ORIG"]},
+        "CHART-A2": {"id": "CHART-A2", "type": "CHART", "meta": {"chartId": 2}, "children": [], "parents": ["ROW-ORIG"]},
+        "CHART-A1": {"id": "CHART-A1", "type": "CHART", "meta": {"chartId": 1}, "children": [], "parents": ["ROW-DUPE"]},
+        "CHART-Z2": {"id": "CHART-Z2", "type": "CHART", "meta": {"chartId": 2}, "children": [], "parents": ["ROW-DUPE"]},
+    }
+
+    class _WS(_WorkspaceBase):
+        def __init__(self) -> None:
+            self.updated_kwargs = None
+
+        def get_resource(self, resource_type: str, resource_id: int):
+            return {"id": resource_id, "position_json": duplicate_position}
+
+        def update_dashboard(self, dashboard_id: int, **kwargs):
+            self.updated_kwargs = kwargs
+            return {"id": dashboard_id}
+
+    ws = _WS()
+    monkeypatch.setattr(server, "_get_ws", lambda: ws)
+    monkeypatch.setattr(server, "record_mutation", lambda entry: None)
+
+    raw = server.repair_dashboard_layout_duplicates.fn(
+        dashboard_id=80,
+        dry_run=False,
+    )
+    payload = json.loads(raw)
+    updated_position = json.loads(ws.updated_kwargs["position_json"])
+
+    assert payload["id"] == 80
+    assert updated_position["GRID_ID"]["children"] == ["ROW-ORIG"]
+    assert "ROW-DUPE" not in updated_position
 
 
 # ===================================================================
