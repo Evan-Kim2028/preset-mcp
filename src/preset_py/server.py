@@ -199,12 +199,9 @@ def _format_list(
 
     out: dict[str, Any] = {
         "count": len(records),
-        "response_mode": mode,
         "data": data,
     }
-    if mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps(out, default=str)
 
 
 def _format_detail(record: dict, resource: str, mode: ResponseMode) -> str:
@@ -215,10 +212,7 @@ def _format_detail(record: dict, resource: str, mode: ResponseMode) -> str:
         data = {k: record[k] for k in _DETAIL_STANDARD.get(resource, []) if k in record}
     else:
         data = record
-    out: dict[str, Any] = {"response_mode": mode, "data": data}
-    if mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps({"data": data}, default=str)
 
 
 def _format_sql(
@@ -231,23 +225,15 @@ def _format_sql(
     out: dict[str, Any] = {
         "rowcount": total,
         "columns": columns,
-        "response_mode": mode,
     }
 
     if mode == "compact":
-        out["hint"] = (
-            "Schema only. Use response_mode='standard' for sample rows "
-            "or 'full' for all rows."
-        )
+        pass  # schema-only: columns + rowcount
     elif mode == "standard":
         sample = records[:SQL_SAMPLE_ROWS]
         out["sample_rows"] = sample
         if total > SQL_SAMPLE_ROWS:
             out["truncated"] = True
-            out["hint"] = (
-                f"Showing {len(sample)}/{total} rows. "
-                "Use response_mode='full' for all rows."
-            )
     else:  # full
         if total > TRUNCATION_THRESHOLD:
             head_n = TRUNCATION_THRESHOLD - TRUNCATION_TAIL
@@ -264,7 +250,7 @@ def _format_sql(
             out["rows"] = records
             out["truncated"] = False
 
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps(out, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -1647,7 +1633,7 @@ def _do_mutation(
             after_summary=dry_after,
             dry_run=True,
         ))
-        return json.dumps(preview, indent=2, default=str)
+        return json.dumps(preview, default=str)
 
     # -- Execute path -------------------------------------------------------
     result = execute()
@@ -1686,7 +1672,7 @@ def _do_mutation(
         after_summary=after_summary,
     ))
 
-    return json.dumps(response, indent=2, default=str)
+    return json.dumps(response, default=str)
 
 
 # ===================================================================
@@ -1703,7 +1689,7 @@ def list_workspaces() -> str:
     use_workspace.
     """
     ws = _get_ws()
-    return json.dumps(ws.list_workspaces(), indent=2)
+    return json.dumps(ws.list_workspaces())
 
 
 @mcp.tool()
@@ -2023,7 +2009,7 @@ def workspace_catalog() -> str:
     _log.info(
         "workspace_catalog counts=%s", catalog["counts"],
     )
-    return json.dumps(catalog, indent=2, default=str)
+    return json.dumps(catalog, default=str)
 
 
 # ===================================================================
@@ -2314,7 +2300,7 @@ def describe_dashboard(
             "dataset_count": len(dataset_inventory),
             "markdown_block_count": len(markdown_blocks),
             "warning_count": len(warnings),
-        }, indent=2, default=str)
+        }, default=str)
 
     result: dict[str, Any] = {
         "dashboard": dashboard_meta,
@@ -2329,7 +2315,7 @@ def describe_dashboard(
         result["warning_count"] = len(warnings)
         result["warnings_preview"] = warnings[:3]
 
-    return json.dumps(result, indent=2, default=str)
+    return json.dumps(result, default=str)
 
 
 # ===================================================================
@@ -2380,7 +2366,7 @@ def validate_chart(
             "dashboard_id": result.get("dashboard_id"),
             "status": status,
             "error": result.get("error"),
-        }, indent=2, default=str)
+        }, default=str)
     if response_mode == "standard":
         return json.dumps({
             "chart_id": result.get("chart_id"),
@@ -2397,8 +2383,8 @@ def validate_chart(
             "payload_source": result.get("payload_source"),
             "form_data_source": result.get("form_data_source"),
             "query_context_present": result.get("query_context_present"),
-        }, indent=2, default=str)
-    return json.dumps(result, indent=2, default=str)
+        }, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2429,7 +2415,7 @@ def validate_dashboard(
             "validated": result["validated"],
             "broken_count": len(errors),
             "broken_charts": errors,
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
         summary = {
@@ -2448,8 +2434,8 @@ def validate_dashboard(
                 for item in result.get("results", [])
             ],
         }
-        return json.dumps(summary, indent=2, default=str)
-    return json.dumps(result, indent=2, default=str)
+        return json.dumps(summary, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2474,7 +2460,7 @@ def validate_chart_render(
             "status": result.get("status"),
             "error": result.get("error"),
             "screenshot_path": result.get("screenshot_path"),
-        }, indent=2, default=str)
+        }, default=str)
     if response_mode == "standard":
         return json.dumps({
             "chart_id": result.get("chart_id"),
@@ -2486,8 +2472,8 @@ def validate_chart_render(
             "page_errors": result.get("page_errors"),
             "chart_data_failures": result.get("chart_data_failures"),
             "screenshot_path": result.get("screenshot_path"),
-        }, indent=2, default=str)
-    return json.dumps(result, indent=2, default=str)
+        }, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2511,7 +2497,7 @@ def validate_dashboard_render(
             "chart_count": result.get("chart_count"),
             "validated": result.get("validated"),
             "broken_count": result.get("broken_count"),
-        }, indent=2, default=str)
+        }, default=str)
     if response_mode == "standard":
         broken_summaries: list[dict[str, Any]] = []
         for item in result.get("broken_charts", []):
@@ -2534,8 +2520,8 @@ def validate_dashboard_render(
             "validated": result.get("validated"),
             "broken_count": result.get("broken_count"),
             "broken_charts": broken_summaries,
-        }, indent=2, default=str)
-    return json.dumps(result, indent=2, default=str)
+        }, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2628,7 +2614,7 @@ def verify_chart_workflow(
                 int((dashboard_render or {}).get("broken_count") or 0)
                 if isinstance(dashboard_render, dict) else None
             ),
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
         return json.dumps({
@@ -2669,9 +2655,9 @@ def verify_chart_workflow(
                 }
                 if isinstance(dashboard_render, dict) else None
             ),
-        }, indent=2, default=str)
+        }, default=str)
 
-    return json.dumps(result, indent=2, default=str)
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
@@ -2702,7 +2688,7 @@ def verify_dashboard_structure(
             "missing_id_count": len(report.get("missing_id_nodes", [])),
             "missing_type_count": len(report.get("missing_type_nodes", [])),
             "duplicate_chart_count": len(report.get("duplicate_chart_placements", [])),
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
         return json.dumps({
@@ -2719,13 +2705,13 @@ def verify_dashboard_structure(
             "scope_orphans": report.get("scope_orphans"),
             "attached_missing_layout": report.get("attached_missing_layout"),
             "duplicate_chart_placements": report.get("duplicate_chart_placements"),
-        }, indent=2, default=str)
+        }, default=str)
 
     return json.dumps({
         "dashboard_id": dashboard_id,
         "dashboard_title": dashboard.get("dashboard_title"),
         "structure_report": report,
-    }, indent=2, default=str)
+    }, default=str)
 
 
 @mcp.tool()
@@ -2786,7 +2772,7 @@ def verify_dashboard_workflow(
             "structure_status": structure.get("status"),
             "query_failures": query_failures,
             "render_broken_count": render_broken if include_render else None,
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
         return json.dumps({
@@ -2812,7 +2798,7 @@ def verify_dashboard_workflow(
                 if include_render and isinstance(render_result, dict)
                 else None
             ),
-        }, indent=2, default=str)
+        }, default=str)
 
     return json.dumps({
         "dashboard_id": dashboard_id,
@@ -2821,7 +2807,7 @@ def verify_dashboard_workflow(
         "structure_report": structure,
         "query_validation": query_result,
         "render_validation": render_result,
-    }, indent=2, default=str)
+    }, default=str)
 
 
 @mcp.tool()
@@ -2861,7 +2847,7 @@ def capture_dashboard_template(
             "chart_count": chart_count,
             "structure_status": structure.get("status"),
             "output_path": resolved_output,
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
         return json.dumps({
@@ -2876,13 +2862,12 @@ def capture_dashboard_template(
             },
             "example_charts": template.get("charts", [])[:3],
             "output_path": resolved_output,
-            "hint": "Use response_mode='full' to get the full template JSON inline.",
-        }, indent=2, default=str)
+        }, default=str)
 
     payload = dict(template)
     if resolved_output:
         payload["_saved_to"] = resolved_output
-    return json.dumps(payload, indent=2, default=str)
+    return json.dumps(payload, default=str)
 
 
 @mcp.tool()
@@ -2960,12 +2945,12 @@ def capture_golden_templates(
             "output_dir": str(target_dir),
             "saved_count": len(saved),
             "failed_count": len(failures),
-        }, indent=2, default=str)
+        }, default=str)
 
     if response_mode == "standard":
-        return json.dumps(payload, indent=2, default=str)
+        return json.dumps(payload, default=str)
 
-    return json.dumps(payload, indent=2, default=str)
+    return json.dumps(payload, default=str)
 
 
 # ===================================================================
@@ -3199,7 +3184,7 @@ def create_chart(
         payload["_params_warnings"] = params_warnings
     chart_id = _to_int(payload.get("id"))
     if chart_id is None:
-        return json.dumps(payload, indent=2, default=str)
+        return json.dumps(payload, default=str)
 
     if repair_dashboard_refs and dashboards_list:
         repairs: list[dict[str, Any]] = []
@@ -3231,7 +3216,7 @@ def create_chart(
             operation_name="creation",
             operation_past_tense="created",
         )
-    return json.dumps(payload, indent=2, default=str)
+    return json.dumps(payload, default=str)
 
 
 # ===================================================================
@@ -3476,7 +3461,7 @@ def update_chart(
             operation_name="update",
             operation_past_tense="updated",
         )
-    return json.dumps(payload, indent=2, default=str)
+    return json.dumps(payload, default=str)
 
 
 @mcp.tool()
@@ -3616,7 +3601,7 @@ def repair_dashboard_chart_refs(
         }
         if dry_run:
             payload["dry_run"] = True
-        return json.dumps(payload, indent=2, default=str)
+        return json.dumps(payload, default=str)
 
     return _do_mutation(
         tool_name="repair_dashboard_chart_refs",
@@ -3639,8 +3624,6 @@ def repair_dashboard_chart_refs(
             "repair_summary": summary,
         },
     )
-
-
 @mcp.tool()
 @_handle_errors
 def repair_dashboard_layout_duplicates(
@@ -3663,7 +3646,7 @@ def repair_dashboard_layout_duplicates(
             "dashboard_id": dashboard_id,
             "duplicate_chart_placements": [],
             "message": "No duplicate chart placements found.",
-        }, indent=2, default=str)
+        }, default=str)
 
     cleaned = _deduplicate_layout_containers(position)
 
@@ -3690,8 +3673,6 @@ def repair_dashboard_layout_duplicates(
             "nodes_after": len(cleaned),
         },
     )
-
-
 # ===================================================================
 # Tools — Snapshot
 # ===================================================================
@@ -3709,7 +3690,7 @@ def snapshot_workspace() -> str:
     ws = _get_ws()
     snap = ws.snapshot()
     _log.info("snapshot counts=%s", snap.counts)
-    return json.dumps(snap.model_dump(), indent=2, default=str)
+    return json.dumps(snap.model_dump(), default=str)
 
 
 # ===================================================================
@@ -3776,7 +3757,7 @@ def list_mutations(
         "resource_id": resource_id,
         "tool_name": tool_name,
         "entries": entries,
-    }, indent=2, default=str)
+    }, default=str)
 
 
 @mcp.tool()
@@ -3795,7 +3776,7 @@ def list_dashboard_snapshots(
             "count": 0,
             "dashboard_id": dashboard_id,
             "snapshots": [],
-        }, indent=2, default=str)
+        }, default=str)
 
     pattern = "dashboard_*.json" if dashboard_id is None else f"dashboard_{dashboard_id}_*.json"
     files = sorted(
@@ -3822,7 +3803,7 @@ def list_dashboard_snapshots(
         "count": len(records),
         "dashboard_id": dashboard_id,
         "snapshots": records,
-    }, indent=2, default=str)
+    }, default=str)
 
 
 @mcp.tool()
@@ -3892,8 +3873,6 @@ def restore_dashboard_snapshot(
             "allow_id_mismatch": allow_id_mismatch,
         },
     )
-
-
 # ===================================================================
 # Tools — Delete operations (opt-in via PRESET_MCP_ENABLE_DELETE)
 # ===================================================================
@@ -4032,7 +4011,7 @@ if _DELETE_ENABLED:
         """
         exports_dir = AUDIT_DIR / "exports"
         if not exports_dir.exists():
-            return json.dumps({"backups": [], "count": 0}, indent=2)
+            return json.dumps({"backups": [], "count": 0})
 
         backups: list[dict[str, Any]] = []
         for f in sorted(exports_dir.glob("*.zip")):
@@ -4057,7 +4036,7 @@ if _DELETE_ENABLED:
         return json.dumps({
             "backups": backups,
             "count": len(backups),
-        }, indent=2)
+        })
 
     @mcp.tool()
     @_handle_errors
@@ -4109,7 +4088,7 @@ if _DELETE_ENABLED:
             "export_path": export_path,
             "overwrite": overwrite,
             "success": result,
-        }, indent=2)
+        })
 
 
 # ===================================================================
@@ -4153,12 +4132,9 @@ def list_saved_queries(
         data = records
     out: dict[str, Any] = {
         "count": len(records),
-        "response_mode": response_mode,
         "data": data,
     }
-    if response_mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps(out, default=str)
 
 
 @mcp.tool()
@@ -4184,10 +4160,7 @@ def get_saved_query(
         ] if k in record}
     else:
         data = record
-    out: dict[str, Any] = {"response_mode": response_mode, "data": data}
-    if response_mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps({"data": data}, default=str)
 
 
 @mcp.tool()
@@ -4346,12 +4319,9 @@ def list_css_templates(
         data = records
     out: dict[str, Any] = {
         "count": len(records),
-        "response_mode": response_mode,
         "data": data,
     }
-    if response_mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps(out, default=str)
 
 
 @mcp.tool()
@@ -4376,10 +4346,7 @@ def get_css_template(
         ] if k in record}
     else:
         data = record
-    out: dict[str, Any] = {"response_mode": response_mode, "data": data}
-    if response_mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps({"data": data}, default=str)
 
 
 @mcp.tool()
@@ -4516,12 +4483,9 @@ def list_annotation_layers(
         data = records
     out: dict[str, Any] = {
         "count": len(records),
-        "response_mode": response_mode,
         "data": data,
     }
-    if response_mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps(out, default=str)
 
 
 @mcp.tool()
@@ -4553,10 +4517,7 @@ def get_annotation_layer(
         ]
     else:
         data = {**record, "annotations": annotations}
-    out: dict[str, Any] = {"response_mode": response_mode, "data": data}
-    if response_mode != "full":
-        out["hint"] = "Set response_mode='full' to see all fields."
-    return json.dumps(out, indent=2, default=str)
+    return json.dumps({"data": data}, default=str)
 
 
 @mcp.tool()
@@ -4751,7 +4712,7 @@ def get_async_query_result(
     """
     ws = _get_ws()
     result = ws.async_query_result(query_id)
-    return json.dumps(result, indent=2, default=str)
+    return json.dumps(result, default=str)
 
 
 # ===================================================================
@@ -4778,13 +4739,12 @@ def get_embedded_dashboard(
         return json.dumps({
             "dashboard_id": dashboard_id,
             "embedded": False,
-            "hint": "Use enable_embedded_dashboard to enable embedding.",
-        }, indent=2)
+        })
     return json.dumps({
         "dashboard_id": dashboard_id,
         "embedded": True,
         "data": result,
-    }, indent=2, default=str)
+    }, default=str)
 
 
 @mcp.tool()
