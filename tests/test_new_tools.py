@@ -33,6 +33,130 @@ class _WorkspaceBase:
 
 
 # ===================================================================
+# Official Audit Logs
+# ===================================================================
+
+_LOG_RECORDS = [
+    {
+        "id": 10,
+        "action": "dashboard.update",
+        "dttm": "2026-03-10T14:48:33Z",
+        "user_id": 75,
+        "dashboard_id": 170,
+        "path": "/api/v1/dashboard/170",
+    },
+    {
+        "id": 11,
+        "action": "chart.update",
+        "dttm": "2026-03-10T15:00:00Z",
+        "user_id": 75,
+        "slice_id": 1392,
+        "path": "/api/v1/chart/1392",
+    },
+]
+
+
+class _LogsWS(_WorkspaceBase):
+    def logs(self, *, page: int = 0, page_size: int = 50, **kwargs):
+        assert page_size == 50
+        records = list(_LOG_RECORDS) if page == 0 else []
+        return {"count": len(_LOG_RECORDS), "result": records}
+
+    def log_detail(self, log_id: int):
+        for record in _LOG_RECORDS:
+            if record["id"] == log_id:
+                return dict(record)
+        raise ValueError(f"not found: {log_id}")
+
+
+class _LogsUnavailableWS(_WorkspaceBase):
+    def logs(self, **kwargs):
+        raise ValueError(
+            "List audit logs failed: the official audit-log endpoint is unavailable "
+            "in this Preset/Superset deployment or for the current role."
+        )
+
+    def log_detail(self, log_id: int):
+        raise ValueError("unavailable")
+
+
+def test_list_logs_standard(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_get_ws", lambda: _LogsWS())
+    raw = server.list_logs.fn(response_mode="standard")
+    payload = json.loads(raw)
+    assert payload["count"] == 2
+    first = payload["data"][0]
+    assert first["id"] == 10
+    assert first["action"] == "dashboard.update"
+
+
+def test_list_logs_dashboard_filter(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_get_ws", lambda: _LogsWS())
+    raw = server.list_logs.fn(dashboard_id=170)
+    payload = json.loads(raw)
+    assert payload["count"] == 1
+    assert payload["data"][0]["id"] == 10
+
+
+def test_get_log_compact(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_get_ws", lambda: _LogsWS())
+    raw = server.get_log.fn(log_id=10, response_mode="compact")
+    payload = json.loads(raw)
+    assert payload["data"] == {
+        "id": 10,
+        "action": "dashboard.update",
+        "dttm": "2026-03-10T14:48:33Z",
+    }
+
+
+def test_get_dashboard_history_combines_official_and_local(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_get_ws", lambda: _LogsWS())
+    monkeypatch.setattr(
+        server,
+        "_read_mutation_entries",
+        lambda **kwargs: [{
+            "timestamp": "2026-03-10T14:48:33Z",
+            "tool_name": "update_dashboard",
+            "action": "update",
+            "fields_changed": ["position_json"],
+            "dry_run": False,
+        }],
+    )
+    monkeypatch.setattr(
+        server,
+        "_list_dashboard_snapshot_records",
+        lambda dashboard_id, limit: [{
+            "snapshot_path": "/tmp/dashboard_170.json",
+            "dashboard_id": dashboard_id,
+            "timestamp_token": "20260310T144832Z",
+            "size_bytes": 123,
+            "modified_at": "2026-03-10T14:48:32Z",
+        }],
+    )
+
+    raw = server.get_dashboard_history.fn(dashboard_id=170)
+    payload = json.loads(raw)
+    assert payload["official_logs"]["available"] is True
+    assert payload["official_logs"]["count"] == 1
+    assert payload["local_history"]["mutation_count"] == 1
+    assert payload["local_history"]["snapshot_count"] == 1
+
+
+def test_get_dashboard_history_handles_missing_official_logs(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_get_ws", lambda: _LogsUnavailableWS())
+    monkeypatch.setattr(server, "_read_mutation_entries", lambda **kwargs: [])
+    monkeypatch.setattr(
+        server, "_list_dashboard_snapshot_records", lambda dashboard_id, limit: []
+    )
+
+    raw = server.get_dashboard_history.fn(dashboard_id=170)
+    payload = json.loads(raw)
+    assert payload["official_logs"]["available"] is False
+    assert payload["official_logs"]["count"] == 0
+    assert payload["local_history"]["mutation_count"] == 0
+
+
+# ===================================================================
 # Saved Queries
 # ===================================================================
 
