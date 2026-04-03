@@ -1,4 +1,7 @@
 name: table_default
-page_length: 25
+row_limit: 1000
+server_page_length: 25
+order_by_cols: []
+order_desc: true
 show_row_numbers: true
 sticky_pagination: true

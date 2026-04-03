@@ -99,6 +99,23 @@ def test_load_chart_preset_reads_timeseries_defaults() -> None:
 
     assert preset["x_axis_title_margin"] == 30
     assert preset["y_axis_title_margin"] == 50
+    assert preset["legend_orientation"] == "top"
+
+
+def test_load_chart_preset_reads_pie_defaults() -> None:
+    preset = load_chart_preset("pie_default")
+
+    assert preset["legend_orientation"] == "top"
+    assert preset["labels_outside"] is True
+    assert preset["number_format"] == "SMART_NUMBER"
+
+
+def test_load_chart_preset_reads_table_defaults() -> None:
+    preset = load_chart_preset("table_default")
+
+    assert preset["row_limit"] == 1000
+    assert preset["order_by_cols"] == []
+    assert preset["order_desc"] is True
 
 
 def test_plan_add_tab_returns_structural_change_without_mutating_file() -> None:
