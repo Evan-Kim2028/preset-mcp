@@ -1,0 +1,22 @@
+dashboard_title: "[Research] Tabbed Dashboard"
+position:
+  ROOT_ID:
+    id: ROOT_ID
+    type: ROOT
+    children: [TABS_ID]
+  TABS_ID:
+    id: TABS_ID
+    type: TABS
+    parents: [ROOT_ID]
+    children: [TAB-1]
+  TAB-1:
+    id: TAB-1
+    type: TAB
+    parents: [ROOT_ID, TABS_ID]
+    children: [GRID_ID]
+  GRID_ID:
+    id: GRID_ID
+    type: GRID
+    parents: [ROOT_ID, TABS_ID, TAB-1]
+    children: []
+metadata: {}
