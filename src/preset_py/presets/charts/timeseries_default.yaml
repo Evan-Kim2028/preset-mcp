@@ -1,0 +1,5 @@
+name: timeseries_default
+x_axis_title_margin: 30
+y_axis_title_margin: 50
+legend_orientation: top
+rich_tooltip: true

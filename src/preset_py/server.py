@@ -100,6 +100,7 @@ _COMPACT: dict[str, list[str]] = {
     "chart": ["id", "slice_name", "viz_type"],
     "dataset": ["id", "table_name", "schema"],
     "database": ["id", "database_name", "backend"],
+    "log": ["id", "action", "dttm"],
 }
 
 _STANDARD: dict[str, list[str]] = {
@@ -119,6 +120,10 @@ _STANDARD: dict[str, list[str]] = {
         "id", "database_name", "backend", "expose_in_sqllab",
         "allow_dml",
     ],
+    "log": [
+        "id", "action", "dttm", "user", "user_id", "path",
+        "dashboard_id", "slice_id", "dashboard_title",
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -133,6 +138,7 @@ _DETAIL_COMPACT: dict[str, list[str]] = {
     "chart": ["id", "slice_name", "viz_type", "datasource_id", "datasource_type"],
     "dataset": ["id", "table_name", "schema", "database", "kind"],
     "database": ["id", "database_name", "backend"],
+    "log": ["id", "action", "dttm"],
 }
 
 _DETAIL_STANDARD: dict[str, list[str]] = {
@@ -153,6 +159,10 @@ _DETAIL_STANDARD: dict[str, list[str]] = {
     "database": [
         "id", "database_name", "backend", "expose_in_sqllab",
         "allow_dml", "configuration_method",
+    ],
+    "log": [
+        "id", "action", "dttm", "user", "user_id", "path",
+        "dashboard_id", "slice_id", "dashboard_title", "json", "referrer",
     ],
 }
 
@@ -253,6 +263,15 @@ def _format_sql(
     return json.dumps(out, default=str)
 
 
+def _format_log_records(records: list[dict[str, Any]], mode: ResponseMode) -> list[dict[str, Any]]:
+    """Apply progressive disclosure to official audit-log records."""
+    if mode == "compact":
+        return _pick(records, _COMPACT["log"])
+    if mode == "standard":
+        return _pick(records, _STANDARD["log"])
+    return records
+
+
 # ---------------------------------------------------------------------------
 # Client-side name filter
 # ---------------------------------------------------------------------------
@@ -270,6 +289,88 @@ def _filter_by_name(records: list[dict], resource: str, name_contains: str) -> l
     key = _NAME_KEYS.get(resource, "name")
     needle = name_contains.lower()
     return [r for r in records if needle in str(r.get(key, "")).lower()]
+
+
+def _record_contains_exact_int(value: Any, target: int) -> bool:
+    """Recursively search a payload for an exact integer match."""
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == target
+    if isinstance(value, str):
+        return re.search(rf"(?<!\d){target}(?!\d)", value) is not None
+    if isinstance(value, list):
+        return any(_record_contains_exact_int(item, target) for item in value)
+    if isinstance(value, dict):
+        return any(_record_contains_exact_int(item, target) for item in value.values())
+    return False
+
+
+def _record_contains_text(value: Any, needle: str) -> bool:
+    """Recursively search a payload for a case-insensitive text match."""
+    lowered = needle.lower()
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return lowered in value.lower()
+    if isinstance(value, (int, float)):
+        return lowered in str(value).lower()
+    if isinstance(value, list):
+        return any(_record_contains_text(item, needle) for item in value)
+    if isinstance(value, dict):
+        return any(
+            lowered in str(key).lower() or _record_contains_text(item, needle)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _log_matches_dashboard(record: dict[str, Any], dashboard_id: int) -> bool:
+    """Best-effort match for dashboard-related audit-log records."""
+    direct_keys = (
+        "dashboard_id", "dashboard", "dashboard_title",
+        "item_id", "object_id", "target_id",
+    )
+    for key in direct_keys:
+        if key in record and _record_contains_exact_int(record.get(key), dashboard_id):
+            return True
+
+    if not _record_contains_text(record, "dashboard"):
+        return False
+    return _record_contains_exact_int(record, dashboard_id)
+
+
+def _list_dashboard_snapshot_records(
+    dashboard_id: int | None = None,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Return local dashboard snapshot metadata records."""
+    snap_dir = AUDIT_DIR / "snapshots"
+    if not snap_dir.exists():
+        return []
+
+    pattern = "dashboard_*.json" if dashboard_id is None else f"dashboard_{dashboard_id}_*.json"
+    files = sorted(
+        snap_dir.glob(pattern),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    records: list[dict[str, Any]] = []
+    for snap in files[:limit]:
+        stem_parts = snap.stem.split("_")
+        snap_dashboard_id = _to_int(stem_parts[1]) if len(stem_parts) >= 3 else None
+        timestamp_token = stem_parts[2] if len(stem_parts) >= 3 else None
+        records.append({
+            "snapshot_path": str(snap),
+            "dashboard_id": snap_dashboard_id,
+            "timestamp_token": timestamp_token,
+            "size_bytes": snap.stat().st_size,
+            "modified_at": datetime.fromtimestamp(
+                snap.stat().st_mtime, tz=timezone.utc
+            ).isoformat(),
+        })
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -1939,6 +2040,173 @@ def list_databases(
         raw = _filter_by_name(raw, "database", name_contains)
     _log.info("list_databases count=%d mode=%s", len(raw), response_mode)
     return _format_list(raw, "database", response_mode)
+
+
+@mcp.tool()
+@_handle_errors
+def list_logs(
+    response_mode: ResponseMode = "standard",
+    action: str | None = None,
+    dashboard_id: int | None = None,
+    user_id: int | None = None,
+    text_contains: str | None = None,
+    page: int = 0,
+    limit: int = 50,
+) -> str:
+    """List official audit logs from Preset/Superset when available.
+
+    This wraps the workspace's `/api/v1/log/` endpoint. Some Preset
+    deployments do not expose this route or restrict it to certain plans/roles.
+
+    Args:
+        response_mode: 'compact', 'standard', or 'full'. Default: standard.
+        action: Case-insensitive substring filter on the log action.
+        dashboard_id: Best-effort filter for dashboard-related log entries.
+        user_id: Exact-match filter for user IDs found in the log payload.
+        text_contains: Case-insensitive substring filter across the record.
+        page: Zero-based results page to fetch from the API.
+        limit: Page size / max records fetched from the API. Default: 50.
+    """
+    if page < 0:
+        raise ValueError("page must be >= 0.")
+    if limit < 1 or limit > 100:
+        raise ValueError("limit must be between 1 and 100.")
+
+    ws = _get_ws()
+    payload = ws.logs(page=page, page_size=limit)
+    records = payload.get("result", [])
+    if not isinstance(records, list):
+        raise ValueError("List audit logs failed: malformed API response.")
+
+    if action:
+        needle = action.lower()
+        records = [
+            r for r in records
+            if needle in str(r.get("action", "")).lower()
+        ]
+    if dashboard_id is not None:
+        records = [r for r in records if _log_matches_dashboard(r, dashboard_id)]
+    if user_id is not None:
+        records = [r for r in records if _record_contains_exact_int(r, user_id)]
+    if text_contains:
+        records = [r for r in records if _record_contains_text(r, text_contains)]
+
+    out: dict[str, Any] = {
+        "count": len(records),
+        "page": page,
+        "limit": limit,
+        "data": _format_log_records(records, response_mode),
+    }
+    total = payload.get("count")
+    if isinstance(total, int):
+        out["total_available"] = total
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def get_log(
+    log_id: int,
+    response_mode: ResponseMode = "full",
+) -> str:
+    """Get detail for a single official audit-log record."""
+    ws = _get_ws()
+    record = ws.log_detail(log_id)
+    if response_mode == "compact":
+        data = {k: record[k] for k in _DETAIL_COMPACT["log"] if k in record}
+    elif response_mode == "standard":
+        data = {k: record[k] for k in _DETAIL_STANDARD["log"] if k in record}
+    else:
+        data = record
+    return json.dumps({"data": data}, default=str)
+
+
+@mcp.tool()
+@_handle_errors
+def get_dashboard_history(
+    dashboard_id: int,
+    limit: int = 50,
+    include_local: bool = True,
+    response_mode: ResponseMode = "standard",
+    max_scan_pages: int = 5,
+) -> str:
+    """Return a dashboard-focused history view from official logs and local audit.
+
+    This tool first tries the official `/api/v1/log/` endpoint. If that route
+    is unavailable, it returns a capability note instead of failing. When
+    `include_local=True`, it also includes the MCP's local mutation journal and
+    pre-mutation dashboard snapshots.
+
+    Args:
+        dashboard_id: Dashboard ID to inspect.
+        limit: Maximum matching records to return per history source.
+        include_local: Include MCP-local mutation journal and snapshots.
+        response_mode: 'compact', 'standard', or 'full' for official log entries.
+        max_scan_pages: Max official log pages to scan before stopping.
+    """
+    if limit < 1 or limit > 100:
+        raise ValueError("limit must be between 1 and 100.")
+    if max_scan_pages < 1 or max_scan_pages > 20:
+        raise ValueError("max_scan_pages must be between 1 and 20.")
+
+    ws = _get_ws()
+    official: dict[str, Any] = {
+        "available": True,
+        "match_strategy": "best_effort dashboard-id + dashboard-token match",
+        "entries": [],
+        "scanned_pages": 0,
+        "scanned_records": 0,
+    }
+
+    page_size = min(100, max(limit, 25))
+    try:
+        matches: list[dict[str, Any]] = []
+        for page in range(max_scan_pages):
+            payload = ws.logs(page=page, page_size=page_size)
+            page_records = payload.get("result", [])
+            if not isinstance(page_records, list):
+                raise ValueError("List audit logs failed: malformed API response.")
+            official["scanned_pages"] = page + 1
+            official["scanned_records"] += len(page_records)
+            matches.extend(
+                record for record in page_records
+                if isinstance(record, dict) and _log_matches_dashboard(record, dashboard_id)
+            )
+            if len(matches) >= limit or not page_records:
+                break
+        official["entries"] = _format_log_records(matches[:limit], response_mode)
+        official["count"] = len(matches[:limit])
+    except ValueError as exc:
+        official = {
+            "available": False,
+            "error": str(exc),
+            "entries": [],
+            "count": 0,
+        }
+
+    out: dict[str, Any] = {
+        "dashboard_id": dashboard_id,
+        "official_logs": official,
+    }
+
+    if include_local:
+        mutations = _read_mutation_entries(
+            limit=limit,
+            resource_type="dashboard",
+            resource_id=dashboard_id,
+        )
+        snapshots = _list_dashboard_snapshot_records(dashboard_id, limit=limit)
+        out["local_history"] = {
+            "mutation_count": len(mutations),
+            "snapshot_count": len(snapshots),
+            "mutations": mutations if response_mode == "full" else _pick(
+                mutations,
+                ["timestamp", "tool_name", "action", "fields_changed", "dry_run"],
+            ),
+            "snapshots": snapshots,
+        }
+
+    return json.dumps(out, default=str)
 
 
 # ===================================================================
@@ -3777,35 +4045,7 @@ def list_dashboard_snapshots(
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500.")
 
-    snap_dir = AUDIT_DIR / "snapshots"
-    if not snap_dir.exists():
-        return json.dumps({
-            "count": 0,
-            "dashboard_id": dashboard_id,
-            "snapshots": [],
-        }, default=str)
-
-    pattern = "dashboard_*.json" if dashboard_id is None else f"dashboard_{dashboard_id}_*.json"
-    files = sorted(
-        snap_dir.glob(pattern),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    records: list[dict[str, Any]] = []
-    for snap in files[:limit]:
-        stem_parts = snap.stem.split("_")
-        snap_dashboard_id = _to_int(stem_parts[1]) if len(stem_parts) >= 3 else None
-        timestamp_token = stem_parts[2] if len(stem_parts) >= 3 else None
-        records.append({
-            "snapshot_path": str(snap),
-            "dashboard_id": snap_dashboard_id,
-            "timestamp_token": timestamp_token,
-            "size_bytes": snap.stat().st_size,
-            "modified_at": datetime.fromtimestamp(
-                snap.stat().st_mtime, tz=timezone.utc
-            ).isoformat(),
-        })
-
+    records = _list_dashboard_snapshot_records(dashboard_id, limit=limit)
     return json.dumps({
         "count": len(records),
         "dashboard_id": dashboard_id,
@@ -5003,6 +5243,53 @@ def disable_embedded_dashboard(
         dry_run=dry_run,
         execute=lambda: ws.delete_embedded_dashboard(dashboard_id) or {},
     )
+
+
+# ===================================================================
+# Tools — Workflow Planning
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def plan_dashboard_changes(
+    dashboard_id: int | None = None,
+    yaml_path: str | None = None,
+    operations: str = "[]",
+) -> str:
+    """Plan dashboard workflow changes without applying them."""
+    requested = json.loads(operations)
+    if not isinstance(requested, list) or not requested:
+        raise ValueError("Provide at least one workflow operation.")
+
+    if yaml_path:
+        first = requested[0]
+        if isinstance(first, dict) and first.get("kind") == "add_tab":
+            from preset_py.workflow.planner import plan_add_tab
+
+            payload = plan_add_tab(
+                yaml_path=Path(yaml_path),
+                tab_name=str(first["tab_name"]),
+            )
+            return json.dumps(payload, default=str)
+        raise ValueError("Unsupported YAML workflow operation set.")
+
+    if dashboard_id is not None:
+        raise ValueError("Live dashboard workflow planning is not implemented yet.")
+
+    raise ValueError("Provide either yaml_path or dashboard_id.")
+
+
+@mcp.tool()
+@_handle_errors
+def apply_dashboard_plan(plan_json: str) -> str:
+    """Apply a previously planned workflow change set."""
+    from preset_py.workflow.planner import apply_workflow_plan
+
+    plan = json.loads(plan_json)
+    if not isinstance(plan, dict):
+        raise ValueError("plan_json must decode to an object.")
+    return json.dumps(apply_workflow_plan(plan), default=str)
 
 
 # ===================================================================

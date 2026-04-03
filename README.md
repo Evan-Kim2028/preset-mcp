@@ -42,7 +42,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 
 ```bash
 claude mcp list
-# Should show: preset-mcp  ... 63 tools
+# Should show: preset-mcp  ... 68 tools
 ```
 
 Then in a Claude Code session, try:
@@ -63,7 +63,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
   preset-mcp -- uv run --directory /path/to/preset-mcp preset-mcp
 ```
 
-## Tools (63)
+## Tools (68)
 
 ### Workspace Navigation
 
@@ -84,6 +84,9 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 | `get_dataset` | Get detail for a single dataset (columns, metrics, SQL) |
 | `list_databases` | List database connections |
 | `get_database` | Get detail for a single database connection |
+| `list_logs` | List official audit logs when the workspace exposes them |
+| `get_log` | Get detail for a single official audit-log record |
+| `get_dashboard_history` | Combine official dashboard audit logs with local MCP history |
 | `workspace_catalog` | Relationship-aware topology map |
 
 ### Create
@@ -101,6 +104,13 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 | `update_dataset` | Change a dataset's SQL, name, or description |
 | `update_chart` | Change a chart's title, viz type, or parameters |
 | `update_dashboard` | Rename or publish/unpublish a dashboard |
+
+### Workflow
+
+| Tool | Purpose |
+|------|---------|
+| `plan_dashboard_changes` | Return a plan-first workflow diff for supported dashboard edits |
+| `apply_dashboard_plan` | Apply a previously planned workflow change set |
 
 ### Dashboard Lifecycle
 
@@ -129,6 +139,9 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 | `verify_dashboard_structure` | Validate dashboard layout graph and chart references |
 | `verify_dashboard_workflow` | One-shot dashboard structure/query/render verification |
 | `repair_dashboard_chart_refs` | Repair stale dashboard chart ID references |
+| `list_logs` | Read official audit logs from `/api/v1/log/` when available |
+| `get_log` | Inspect a single official audit-log record |
+| `get_dashboard_history` | Best-effort dashboard history from official logs + local snapshots |
 | `list_mutations` | Inspect local mutation audit journal entries |
 | `list_dashboard_snapshots` | List local pre-mutation dashboard snapshots |
 | `restore_dashboard_snapshot` | Restore dashboard layout/settings from local snapshot |
@@ -149,6 +162,16 @@ The intended workflow pairs preset-mcp with a data warehouse MCP (like [igloo-mc
 6. create_chart + create_dashboard     (preset-mcp) — build the viz
 7. update_dataset / update_chart       (preset-mcp) — iterate
 ```
+
+## Workflow Layer
+
+The workflow layer is additive and plan-first. It does not replace the existing low-level Preset tools.
+
+1. Call `plan_dashboard_changes` or a future convenience `plan_*` workflow helper.
+2. Inspect the returned plan payload and structural changes.
+3. Call `apply_dashboard_plan` to mutate the target.
+
+Local mode uses exported YAML as the canonical authoring artifact. Flat dashboards remain first-class, and tabs are only created through explicit tab operations or tabbed layout presets.
 
 ## Features
 
@@ -201,6 +224,17 @@ JSON logs on stderr (stdout is reserved for the STDIO transport):
 ```json
 {"ts":"2025-02-11 12:00:00","level":"INFO","msg":"tool=list_dashboards status=ok duration_ms=234"}
 ```
+
+### Official Audit Logs
+
+`list_logs`, `get_log`, and `get_dashboard_history` wrap Superset's
+official `/api/v1/log/` endpoint when the workspace exposes it. Some
+Preset deployments return `404 Not found` for that route or restrict it
+to specific plans/roles. In those environments:
+
+- `list_logs` / `get_log` return a structured error
+- `get_dashboard_history` reports official-log unavailability but still
+  returns MCP-local mutation journal and snapshot history when present
 
 ## Configuration
 

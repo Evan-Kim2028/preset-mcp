@@ -1,0 +1,25 @@
+dashboard_title: "[Research] Yield Simple"
+position:
+  ROOT_ID:
+    id: ROOT_ID
+    type: ROOT
+    children: [GRID_ID]
+  GRID_ID:
+    id: GRID_ID
+    type: GRID
+    parents: [ROOT_ID]
+    children: [ROW-1]
+  ROW-1:
+    id: ROW-1
+    type: ROW
+    parents: [ROOT_ID, GRID_ID]
+    children: [CHART-1384]
+  CHART-1384:
+    id: CHART-1384
+    type: CHART
+    parents: [ROOT_ID, GRID_ID, ROW-1]
+    children: []
+    meta:
+      chartId: 1384
+      sliceName: USDC Supplier Yield Share (Annualized, Active)
+metadata: {}

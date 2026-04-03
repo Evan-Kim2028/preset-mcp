@@ -1,0 +1,5 @@
+name: flat_two_up
+mode: flat
+charts_per_row: 2
+chart_width: 6
+insertion_order: row_major

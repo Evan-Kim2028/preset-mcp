@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pandas as pd
+import prison
 from yarl import URL
 
 from preset_cli.auth.lib import get_access_token
@@ -650,6 +651,21 @@ def _api_error_message(body: Any) -> str:
     return " | ".join(dict.fromkeys(messages))
 
 
+def _audit_log_endpoint_error(operation: str, message: str) -> ValueError:
+    """Return a stable error when official audit-log endpoints are unavailable."""
+    lowered = message.lower()
+    if "not found" in lowered or "404" in lowered:
+        return ValueError(
+            f"{operation} failed: the official audit-log endpoint is unavailable "
+            "in this Preset/Superset deployment or for the current role."
+        )
+    if "forbidden" in lowered or "401" in lowered or "403" in lowered:
+        return ValueError(
+            f"{operation} failed: access to the official audit-log endpoint was denied."
+        )
+    return ValueError(f"{operation} failed: {message}")
+
+
 def _infer_dataset_time_column(dataset: dict[str, Any]) -> str | None:
     """Infer a default datetime column when exactly one exists."""
     raw_columns = dataset.get("columns")
@@ -933,6 +949,39 @@ class PresetWorkspace:
 
     def databases(self, **filters: Any) -> list[dict[str, Any]]:
         return self._client.get_databases(**filters)
+
+    def logs(
+        self,
+        *,
+        page: int = 0,
+        page_size: int = 50,
+        order_column: str = "dttm",
+        order_direction: Literal["asc", "desc"] = "desc",
+    ) -> dict[str, Any]:
+        """Return one page of official audit logs, if the endpoint is available."""
+        query = prison.dumps({
+            "page": page,
+            "page_size": page_size,
+            "order_column": order_column,
+            "order_direction": order_direction,
+        })
+        endpoint = str(self._client.baseurl / "api/v1" / "log" / "" % {"q": query})
+        try:
+            return self._request_json("get", endpoint, "List audit logs")
+        except ValueError as exc:
+            raise _audit_log_endpoint_error("List audit logs", str(exc)) from exc
+
+    def log_detail(self, log_id: int) -> dict[str, Any]:
+        """Fetch a single official audit-log record by id."""
+        endpoint = str(self._client.baseurl / "api/v1" / "log" / str(log_id))
+        try:
+            payload = self._request_json("get", endpoint, f"Get audit log {log_id}")
+        except ValueError as exc:
+            raise _audit_log_endpoint_error("Get audit log", str(exc)) from exc
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise ValueError("Get audit log failed: malformed API response.")
+        return result
 
     def get_resource(self, resource_type: str, resource_id: int) -> dict[str, Any]:
         """Fetch a single resource by type and ID."""

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -1571,3 +1572,39 @@ def test_update_chart_returns_result_on_validation_timeout(monkeypatch) -> None:
     assert payload["_validation"]["status"] == "timeout"
     assert payload["_validation"]["error_type"] == "TimeoutError"
     assert "updated successfully" in payload["_validation"]["error"]
+
+
+def test_plan_dashboard_changes_supports_yaml_target(tmp_path: Path) -> None:
+    dashboard = tmp_path / "dashboard.yaml"
+    dashboard.write_text("dashboard_title: demo\nposition: {}\nmetadata: {}\n")
+
+    raw = server.plan_dashboard_changes.fn(
+        yaml_path=str(dashboard),
+        operations='[{"kind":"add_tab","tab_name":"Sandbox"}]',
+    )
+
+    payload = json.loads(raw)
+    assert payload["status"] == "planned"
+    assert payload["target"]["mode"] == "yaml"
+
+
+def test_apply_dashboard_plan_supports_yaml_target(tmp_path: Path) -> None:
+    dashboard = tmp_path / "dashboard.yaml"
+    fixture = Path("tests/fixtures/workflow/research_yield_simple.yaml")
+    dashboard.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+
+    plan = {
+        "status": "planned",
+        "target": {"mode": "yaml", "path": str(dashboard)},
+        "summary": "Plan add tab 'Sandbox' (flat -> tabbed)",
+        "changes": [
+            {"kind": "mode_transition", "from": "flat", "to": "tabbed"},
+            {"kind": "add_tab", "tab_name": "Sandbox"},
+        ],
+    }
+
+    raw = server.apply_dashboard_plan.fn(plan_json=json.dumps(plan))
+
+    payload = json.loads(raw)
+    assert payload["status"] == "applied"
+    assert "type: TABS" in dashboard.read_text(encoding="utf-8")
