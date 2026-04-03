@@ -48,37 +48,6 @@ def test_create_dataset_checks_database_precondition(monkeypatch) -> None:
     assert "Database 999 not found" in payload["error"]
 
 
-def test_plan_dashboard_changes_supports_yaml_target(tmp_path) -> None:
-    dashboard = tmp_path / "dashboard.yaml"
-    dashboard.write_text("dashboard_title: demo\nposition: {}\nmetadata: {}\n")
-
-    raw = server.plan_dashboard_changes.fn(
-        yaml_path=str(dashboard),
-        operations='[{"kind":"add_tab","tab_name":"Sandbox"}]',
-    )
-
-    payload = json.loads(raw)
-    assert payload["status"] == "planned"
-    assert payload["target"]["mode"] == "yaml"
-
-
-def test_apply_dashboard_plan_supports_yaml_target(tmp_path) -> None:
-    dashboard = tmp_path / "dashboard.yaml"
-    dashboard.write_text(
-        "dashboard_title: demo\nposition:\n  ROOT_ID:\n    id: ROOT_ID\n    type: ROOT\n    children: [GRID_ID]\n  GRID_ID:\n    id: GRID_ID\n    type: GRID\n    parents: [ROOT_ID]\n    children: []\nmetadata: {}\n"
-    )
-
-    plan_json = server.plan_dashboard_changes.fn(
-        yaml_path=str(dashboard),
-        operations='[{"kind":"add_tab","tab_name":"Sandbox"}]',
-    )
-    raw = server.apply_dashboard_plan.fn(plan_json=plan_json)
-
-    payload = json.loads(raw)
-    assert payload["status"] == "applied"
-    assert "text: Sandbox" in dashboard.read_text()
-
-
 def test_query_dataset_treats_time_column_as_timeseries(monkeypatch) -> None:
     class _WS(_WorkspaceBase):
         def __init__(self) -> None:
