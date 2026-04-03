@@ -1,0 +1,4 @@
+name: table_default
+page_length: 25
+show_row_numbers: true
+sticky_pagination: true

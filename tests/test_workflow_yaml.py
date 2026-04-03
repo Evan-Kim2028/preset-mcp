@@ -2,6 +2,7 @@ from pathlib import Path
 
 from preset_py.workflow.document import load_dashboard_yaml_document
 from preset_py.workflow.layout_ops import find_chart_node_ids, list_tab_ids
+from preset_py.workflow.presets import load_chart_preset, load_layout_preset
 
 
 def test_load_dashboard_yaml_document_reads_flat_fixture() -> None:
@@ -77,3 +78,17 @@ def test_find_chart_node_ids_recognizes_top_level_chart_id() -> None:
     }
 
     assert find_chart_node_ids(position) == {101: ["CHART-1"]}
+
+
+def test_load_layout_preset_reads_flat_two_up() -> None:
+    preset = load_layout_preset("flat_two_up")
+
+    assert preset["mode"] == "flat"
+    assert preset["charts_per_row"] == 2
+
+
+def test_load_chart_preset_reads_timeseries_defaults() -> None:
+    preset = load_chart_preset("timeseries_default")
+
+    assert preset["x_axis_title_margin"] == 30
+    assert preset["y_axis_title_margin"] == 50
