@@ -99,6 +99,7 @@ def test_load_chart_preset_reads_timeseries_defaults() -> None:
 
 def test_plan_add_tab_returns_structural_change_without_mutating_file() -> None:
     fixture = Path("tests/fixtures/workflow/research_yield_simple.yaml")
+    original = fixture.read_text(encoding="utf-8")
 
     plan = plan_add_tab(yaml_path=fixture, tab_name="Sandbox")
 
@@ -106,6 +107,17 @@ def test_plan_add_tab_returns_structural_change_without_mutating_file() -> None:
     assert plan["target"]["mode"] == "yaml"
     assert any(change["kind"] == "mode_transition" for change in plan["changes"])
     assert "flat" in plan["summary"]
+    assert fixture.read_text(encoding="utf-8") == original
+
+
+def test_plan_add_tab_on_tabbed_dashboard_avoids_fake_mode_transition() -> None:
+    fixture = Path("tests/fixtures/workflow/tabbed_dashboard.yaml")
+
+    plan = plan_add_tab(yaml_path=fixture, tab_name="Sandbox")
+
+    assert plan["status"] == "planned"
+    assert not any(change["kind"] == "mode_transition" for change in plan["changes"])
+    assert plan["changes"] == [{"kind": "add_tab", "tab_name": "Sandbox"}]
 
 
 def test_load_layout_preset_rejects_invalid_name() -> None:
