@@ -24,6 +24,32 @@ def test_load_dashboard_yaml_document_reads_tabbed_fixture() -> None:
     assert "TABS_ID" in document.position
 
 
+def test_load_dashboard_yaml_document_marks_empty_tabs_container_as_tabbed(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / "authoring_tabbed.yaml"
+    fixture.write_text(
+        """
+dashboard_title: "[Research] Empty Tabs Dashboard"
+position:
+  ROOT_ID:
+    id: ROOT_ID
+    type: ROOT
+    children: [TABS_ID]
+  TABS_ID:
+    id: TABS_ID
+    type: TABS
+    parents: [ROOT_ID]
+    children: []
+metadata: {}
+""".strip()
+    )
+
+    document = load_dashboard_yaml_document(fixture)
+
+    assert document.mode == "tabbed"
+
+
 def test_list_tab_ids_returns_empty_for_flat_dashboard() -> None:
     document = load_dashboard_yaml_document(
         Path("tests/fixtures/workflow/research_yield_simple.yaml")
@@ -38,3 +64,16 @@ def test_find_chart_node_ids_returns_chart_nodes() -> None:
     )
 
     assert find_chart_node_ids(document.position) == {1384: ["CHART-1384"]}
+
+
+def test_find_chart_node_ids_recognizes_top_level_chart_id() -> None:
+    position = {
+        "CHART-1": {
+            "id": "CHART-1",
+            "type": "CHART",
+            "chartId": 101,
+            "children": [],
+        }
+    }
+
+    assert find_chart_node_ids(position) == {101: ["CHART-1"]}
