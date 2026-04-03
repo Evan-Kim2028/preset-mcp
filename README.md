@@ -42,7 +42,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 
 ```bash
 claude mcp list
-# Should show: preset-mcp  ... 66 tools
+# Should show: preset-mcp  ... 68 tools
 ```
 
 Then in a Claude Code session, try:
@@ -63,7 +63,7 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
   preset-mcp -- uv run --directory /path/to/preset-mcp preset-mcp
 ```
 
-## Tools (66)
+## Tools (68)
 
 ### Workspace Navigation
 
@@ -104,6 +104,13 @@ claude mcp add --scope user -e PRESET_API_TOKEN=<your-token> \
 | `update_dataset` | Change a dataset's SQL, name, or description |
 | `update_chart` | Change a chart's title, viz type, or parameters |
 | `update_dashboard` | Rename or publish/unpublish a dashboard |
+
+### Workflow
+
+| Tool | Purpose |
+|------|---------|
+| `plan_dashboard_changes` | Return a plan-first workflow diff for supported dashboard edits |
+| `apply_dashboard_plan` | Apply a previously planned workflow change set |
 
 ### Dashboard Lifecycle
 
@@ -155,6 +162,16 @@ The intended workflow pairs preset-mcp with a data warehouse MCP (like [igloo-mc
 6. create_chart + create_dashboard     (preset-mcp) — build the viz
 7. update_dataset / update_chart       (preset-mcp) — iterate
 ```
+
+## Workflow Layer
+
+The workflow layer is additive and plan-first. It does not replace the existing low-level Preset tools.
+
+1. Call `plan_dashboard_changes` or a future convenience `plan_*` workflow helper.
+2. Inspect the returned plan payload and structural changes.
+3. Call `apply_dashboard_plan` to mutate the target.
+
+Local mode uses exported YAML as the canonical authoring artifact. Flat dashboards remain first-class, and tabs are only created through explicit tab operations or tabbed layout presets.
 
 ## Features
 

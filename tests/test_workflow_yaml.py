@@ -4,7 +4,11 @@ import pytest
 
 from preset_py.workflow.document import load_dashboard_yaml_document
 from preset_py.workflow.layout_ops import find_chart_node_ids, list_tab_ids
-from preset_py.workflow.planner import apply_workflow_plan, plan_add_tab
+from preset_py.workflow.planner import (
+    apply_workflow_plan,
+    plan_add_tab,
+    plan_create_chart_with_preset,
+)
 from preset_py.workflow.presets import load_chart_preset, load_layout_preset
 
 
@@ -132,6 +136,21 @@ def test_apply_workflow_plan_writes_tabbed_yaml(tmp_path: Path) -> None:
     written = target.read_text(encoding="utf-8")
     assert "type: TABS" in written
     assert "text: Sandbox" in written
+
+
+def test_plan_create_chart_with_preset_keeps_flat_dashboard_flat(tmp_path: Path) -> None:
+    target = tmp_path / "dashboard.yaml"
+    fixture = Path("tests/fixtures/workflow/research_yield_simple.yaml")
+    target.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+
+    plan = plan_create_chart_with_preset(
+        yaml_path=target,
+        chart_title="New Chart",
+        viz_type="table",
+        chart_preset="table_default",
+    )
+
+    assert not any(change["kind"] == "mode_transition" for change in plan["changes"])
 
 
 def test_load_layout_preset_rejects_invalid_name() -> None:

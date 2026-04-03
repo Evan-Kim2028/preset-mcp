@@ -26,6 +26,30 @@ def plan_add_tab(*, yaml_path: Path, tab_name: str) -> dict[str, Any]:
     return plan.__dict__
 
 
+def plan_create_chart_with_preset(
+    *,
+    yaml_path: Path,
+    chart_title: str,
+    viz_type: str,
+    chart_preset: str,
+) -> dict[str, Any]:
+    document = load_dashboard_yaml_document(Path(yaml_path))
+    plan = WorkflowPlan(
+        status="planned",
+        target={"mode": "yaml", "path": str(yaml_path)},
+        summary=f"Plan create chart '{chart_title}' on {document.mode} dashboard",
+        changes=[
+            {
+                "kind": "create_chart",
+                "title": chart_title,
+                "viz_type": viz_type,
+                "chart_preset": chart_preset,
+            }
+        ],
+    )
+    return plan.__dict__
+
+
 def _tab_meta(text: str) -> dict[str, str]:
     return {
         "text": text,
