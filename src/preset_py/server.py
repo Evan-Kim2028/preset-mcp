@@ -5246,6 +5246,53 @@ def disable_embedded_dashboard(
 
 
 # ===================================================================
+# Tools — Workflow Planning
+# ===================================================================
+
+
+@mcp.tool()
+@_handle_errors
+def plan_dashboard_changes(
+    dashboard_id: int | None = None,
+    yaml_path: str | None = None,
+    operations: str = "[]",
+) -> str:
+    """Plan dashboard workflow changes without applying them."""
+    requested = json.loads(operations)
+    if not isinstance(requested, list) or not requested:
+        raise ValueError("Provide at least one workflow operation.")
+
+    if yaml_path:
+        first = requested[0]
+        if isinstance(first, dict) and first.get("kind") == "add_tab":
+            from preset_py.workflow.planner import plan_add_tab
+
+            payload = plan_add_tab(
+                yaml_path=Path(yaml_path),
+                tab_name=str(first["tab_name"]),
+            )
+            return json.dumps(payload, default=str)
+        raise ValueError("Unsupported YAML workflow operation set.")
+
+    if dashboard_id is not None:
+        raise ValueError("Live dashboard workflow planning is not implemented yet.")
+
+    raise ValueError("Provide either yaml_path or dashboard_id.")
+
+
+@mcp.tool()
+@_handle_errors
+def apply_dashboard_plan(plan_json: str) -> str:
+    """Apply a previously planned workflow change set."""
+    from preset_py.workflow.planner import apply_workflow_plan
+
+    plan = json.loads(plan_json)
+    if not isinstance(plan, dict):
+        raise ValueError("plan_json must decode to an object.")
+    return json.dumps(apply_workflow_plan(plan), default=str)
+
+
+# ===================================================================
 # Entry point
 # ===================================================================
 
