@@ -1,7 +1,10 @@
 from pathlib import Path
 
+import pytest
+
 from preset_py.workflow.document import load_dashboard_yaml_document
 from preset_py.workflow.layout_ops import find_chart_node_ids, list_tab_ids
+from preset_py.workflow.planner import plan_add_tab
 from preset_py.workflow.presets import load_chart_preset, load_layout_preset
 
 
@@ -92,3 +95,30 @@ def test_load_chart_preset_reads_timeseries_defaults() -> None:
 
     assert preset["x_axis_title_margin"] == 30
     assert preset["y_axis_title_margin"] == 50
+
+
+def test_plan_add_tab_returns_structural_change_without_mutating_file() -> None:
+    fixture = Path("tests/fixtures/workflow/research_yield_simple.yaml")
+
+    plan = plan_add_tab(yaml_path=fixture, tab_name="Sandbox")
+
+    assert plan["status"] == "planned"
+    assert plan["target"]["mode"] == "yaml"
+    assert any(change["kind"] == "mode_transition" for change in plan["changes"])
+    assert "flat" in plan["summary"]
+
+
+def test_load_layout_preset_rejects_invalid_name() -> None:
+    with pytest.raises(ValueError, match="invalid preset name"):
+        load_layout_preset("../secrets")
+
+
+def test_load_chart_preset_requires_mapping_payload(tmp_path: Path, monkeypatch) -> None:
+    preset_root = tmp_path / "presets"
+    (preset_root / "charts").mkdir(parents=True)
+    (preset_root / "charts" / "broken.yaml").write_text("- not-a-mapping\n", encoding="utf-8")
+
+    monkeypatch.setattr("preset_py.workflow.presets._PRESET_ROOT", preset_root)
+
+    with pytest.raises(ValueError, match="must contain a mapping"):
+        load_chart_preset("broken")
