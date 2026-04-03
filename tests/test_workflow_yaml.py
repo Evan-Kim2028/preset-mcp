@@ -4,7 +4,7 @@ import pytest
 
 from preset_py.workflow.document import load_dashboard_yaml_document
 from preset_py.workflow.layout_ops import find_chart_node_ids, list_tab_ids
-from preset_py.workflow.planner import plan_add_tab
+from preset_py.workflow.planner import apply_workflow_plan, plan_add_tab
 from preset_py.workflow.presets import load_chart_preset, load_layout_preset
 
 
@@ -118,6 +118,20 @@ def test_plan_add_tab_on_tabbed_dashboard_avoids_fake_mode_transition() -> None:
     assert plan["status"] == "planned"
     assert not any(change["kind"] == "mode_transition" for change in plan["changes"])
     assert plan["changes"] == [{"kind": "add_tab", "tab_name": "Sandbox"}]
+
+
+def test_apply_workflow_plan_writes_tabbed_yaml(tmp_path: Path) -> None:
+    target = tmp_path / "dashboard.yaml"
+    fixture = Path("tests/fixtures/workflow/research_yield_simple.yaml")
+    target.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+
+    plan = plan_add_tab(yaml_path=target, tab_name="Sandbox")
+    result = apply_workflow_plan(plan)
+
+    assert result["status"] == "applied"
+    written = target.read_text(encoding="utf-8")
+    assert "type: TABS" in written
+    assert "text: Sandbox" in written
 
 
 def test_load_layout_preset_rejects_invalid_name() -> None:
